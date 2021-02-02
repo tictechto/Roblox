@@ -1,487 +1,328 @@
 --[[
-	// FileName: ControlScript.lua
-	// Version 1.1
-	// Written by: jmargh and jeditkacheff
-	// Description: Manages in game controls for both touch and keyboard/mouse devices.
+	ControlScript - This module manages the selection of the current character control module
+	and calls update() on the active module on RenderStepped
 	
-	// This script will be inserted into PlayerScripts under each player by default. If you want to
-	// create your own custom controls or modify these controls, you must place a script with this
-	// name, ControlScript, under StarterPlayer -> PlayerScripts.
-	
-	// Required Modules:
-		ClickToMove
-		DPad
-		KeyboardMovement
-		Thumbpad
-		Thumbstick
-		TouchJump
-		MasterControl
-		VehicleController
+	2018 PlayerScripts Update - AllYourBlox		
 --]]
+local ControlScript = {}
 
---[[ Services ]]--
-local ContextActionService = game:GetService('ContextActionService')
-local Players = game:GetService('Players')
-local UserInputService = game:GetService('UserInputService')
-local VRService = game:GetService('VRService')
--- Settings and GameSettings are read only
+--[[ Roblox Services ]]--
+local a = shared
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
 local Settings = UserSettings()
 local GameSettings = Settings.GameSettings
 
--- Issue with play solo? (F6)
-while not UserInputService.KeyboardEnabled and not UserInputService.TouchEnabled and not UserInputService.GamepadEnabled do
-	wait()
+local activeControlModule = nil	-- Used to prevent unnecessarily expensive checks on each input event
+local activeController = nil
+local touchJumpController = nil
+local moveFunction = Players.LocalPlayer.Move
+local humanoid = nil
+local lastInputType = Enum.UserInputType.None
+local cameraRelative = true
+
+-- For Roblox VehicleController
+local humanoidSeatedConn = nil
+local vehicleController = nil
+
+local touchControlFrame = nil
+
+-- Modules - each returns a new() constructor function used to create controllers as needed
+local Keyboard = require(script:WaitForChild("Keyboard"))
+local Gamepad = require(script:WaitForChild("Gamepad"))
+local TouchDPad = require(script:WaitForChild("TouchDPad"))
+local DynamicThumbstick = require(script:WaitForChild("DynamicThumbstick"))
+
+-- These controllers handle only walk/run movement, jumping is handled by the
+-- TouchJump controller if any of these are active
+local ClickToMove = require(script:WaitForChild("ClickToMoveController"))
+local TouchThumbstick = require(script:WaitForChild("TouchThumbstick"))
+local TouchThumbpad = require(script:WaitForChild("TouchThumbpad"))
+local TouchJump = require(script:WaitForChild("TouchJump"))
+
+-- Old control script notes that this must be required but is not used like a control module?
+local VehicleController = require(script:WaitForChild("VehicleController"))
+
+-- The Modules above are used to construct controller instances as-needed, and this
+-- table is a map from Module to the instance created from it
+local controllers = {}
+
+-- Mapping from movement mode and lastInputType enum values to control modules to avoid huge if elseif switching
+local movementEnumToModuleMap = {
+	[Enum.TouchMovementMode.DPad] = TouchDPad,
+	[Enum.DevTouchMovementMode.DPad] = TouchDPad,
+	[Enum.TouchMovementMode.Thumbpad] = TouchThumbpad,
+	[Enum.DevTouchMovementMode.Thumbpad] = TouchThumbpad,
+	[Enum.TouchMovementMode.Thumbstick] = TouchThumbstick,
+	[Enum.DevTouchMovementMode.Thumbstick] = TouchThumbstick,
+	[Enum.TouchMovementMode.DynamicThumbstick] = DynamicThumbstick,
+	[Enum.DevTouchMovementMode.DynamicThumbstick] = DynamicThumbstick,
+	[Enum.TouchMovementMode.ClickToMove] = ClickToMove,
+	[Enum.DevTouchMovementMode.ClickToMove] = ClickToMove,
+
+	-- Current default
+	[Enum.TouchMovementMode.Default] = TouchThumbstick,
+
+	[Enum.ComputerMovementMode.Default] = Keyboard,
+	[Enum.ComputerMovementMode.KeyboardMouse] = Keyboard,
+	[Enum.DevComputerMovementMode.KeyboardMouse] = Keyboard,
+	[Enum.DevComputerMovementMode.Scriptable] = nil,
+	[Enum.ComputerMovementMode.ClickToMove] = ClickToMove,
+	[Enum.DevComputerMovementMode.ClickToMove] = ClickToMove,
+}
+
+-- Keyboard controller is really keyboard and mouse controller
+local computerInputTypeToModuleMap = {
+	[Enum.UserInputType.Keyboard] = Keyboard,
+	[Enum.UserInputType.MouseButton1] = Keyboard,
+	[Enum.UserInputType.MouseButton2] = Keyboard,
+	[Enum.UserInputType.MouseButton3] = Keyboard,
+	[Enum.UserInputType.MouseWheel] = Keyboard,
+	[Enum.UserInputType.MouseMovement] = Keyboard,
+	[Enum.UserInputType.Gamepad1] = Gamepad,
+	[Enum.UserInputType.Gamepad2] = Gamepad,
+	[Enum.UserInputType.Gamepad3] = Gamepad,
+	[Enum.UserInputType.Gamepad4] = Gamepad,
+}
+
+-- Returns module (possibly nil) and success code to differentiate returning nil due to error vs Scriptable
+local function SelectComputerMovementModule()
+	if not (UserInputService.KeyboardEnabled or UserInputService.GamepadEnabled) then
+		return nil, false
+	end
+	local computerModule = nil
+	local DevMovementMode = Players.LocalPlayer.DevComputerMovementMode
+	if DevMovementMode == Enum.DevComputerMovementMode.UserChoice then
+		computerModule = computerInputTypeToModuleMap[lastInputType]
+		if not computerModule then
+			computerModule = movementEnumToModuleMap[GameSettings.ComputerMovementMode]
+		end
+	elseif DevMovementMode == Enum.DevComputerMovementMode.Scriptable then
+		return nil, true
+	elseif DevMovementMode == Enum.DevComputerMovementMode.ClickToMove then
+		computerModule = ClickToMove
+	else
+		computerModule = computerInputTypeToModuleMap[lastInputType]
+		if not computerModule then
+			computerModule = movementEnumToModuleMap[DevMovementMode]
+		end
+	end
+	return computerModule, true
 end
 
---[[ Script Variables ]]--
-while not Players.LocalPlayer do
-	wait()
+-- Choose current Touch control module based on settings (user, dev)
+-- Returns module (possibly nil) and success code to differentiate returning nil due to error vs Scriptable
+local function SelectTouchModule()
+	if not UserInputService.TouchEnabled then
+		return nil, false
+	end
+	local touchModule = nil
+	local DevMovementMode = Players.LocalPlayer.DevTouchMovementMode
+	if DevMovementMode == Enum.DevTouchMovementMode.UserChoice then
+		touchModule = movementEnumToModuleMap[GameSettings.TouchMovementMode]
+	elseif DevMovementMode == Enum.DevTouchMovementMode.Scriptable then
+		return nil, true	
+	else
+		touchModule = movementEnumToModuleMap[DevMovementMode]
+	end
+	return touchModule, true
 end
 
-local lastInputType = nil
-local LocalPlayer = Players.LocalPlayer
-local PlayerGui = LocalPlayer:WaitForChild('PlayerGui')
-local IsTouchDevice = UserInputService.TouchEnabled
-local UserMovementMode = IsTouchDevice and GameSettings.TouchMovementMode or GameSettings.ComputerMovementMode
-local DevMovementMode = IsTouchDevice and LocalPlayer.DevTouchMovementMode or LocalPlayer.DevComputerMovementMode
-local IsUserChoice = (IsTouchDevice and DevMovementMode == Enum.DevTouchMovementMode.UserChoice) or (DevMovementMode == Enum.DevComputerMovementMode.UserChoice)
-local TouchGui = nil
-local TouchControlFrame = nil
-local IsModalEnabled = UserInputService.ModalEnabled
-local BindableEvent_OnFailStateChanged = nil
-local isJumpEnabled = false
+local function OnRenderStepped()
+	if activeController and activeController.enabled and humanoid then
+		local moveVector = activeController:GetMoveVector()
 
--- register what control scripts we are using
-do
-	local PlayerScripts = LocalPlayer:WaitForChild("PlayerScripts")
-	local canRegisterControls = pcall(function() PlayerScripts:RegisterTouchMovementMode(Enum.TouchMovementMode.Default) end)
+		local vehicleConsumedInput = false
+		if vehicleController then
+			moveVector, vehicleConsumedInput = vehicleController:Update(moveVector, activeControlModule==Gamepad)
+		end
 
-	if canRegisterControls then
-		PlayerScripts:RegisterTouchMovementMode(Enum.TouchMovementMode.Thumbstick)
-		PlayerScripts:RegisterTouchMovementMode(Enum.TouchMovementMode.DPad)
-		PlayerScripts:RegisterTouchMovementMode(Enum.TouchMovementMode.Thumbpad)
-		PlayerScripts:RegisterTouchMovementMode(Enum.TouchMovementMode.ClickToMove)
-		PlayerScripts:RegisterTouchMovementMode(Enum.TouchMovementMode.DynamicThumbstick)
+		-- User of vehicleConsumedInput is commented out to preserve legacy behavior, in case some game relies on Humanoid.MoveDirection still being set while in a VehicleSeat
+		--if not vehicleConsumedInput then
+			moveFunction(Players.LocalPlayer, moveVector, cameraRelative)
+		--end
 
-		PlayerScripts:RegisterComputerMovementMode(Enum.ComputerMovementMode.Default)
-		PlayerScripts:RegisterComputerMovementMode(Enum.ComputerMovementMode.KeyboardMouse)
-		PlayerScripts:RegisterComputerMovementMode(Enum.ComputerMovementMode.ClickToMove)
+		humanoid.Jump = activeController:GetIsJumping() or (touchJumpController and touchJumpController:GetIsJumping())
 	end
 end
 
-local DynamicThumbstickAvailable = pcall(function() 
-	return Enum.DevTouchMovementMode.DynamicThumbstick and Enum.TouchMovementMode.DynamicThumbstick
-end)
-
-local FFlagUserNoCameraClickToMoveSuccess, FFlagUserNoCameraClickToMoveResult = pcall(function() return UserSettings():IsUserFeatureEnabled("UserNoCameraClickToMove") end)
-local FFlagUserNoCameraClickToMove = FFlagUserNoCameraClickToMoveSuccess and FFlagUserNoCameraClickToMoveResult
-
---[[ Modules ]]--
-local ClickToMoveTouchControls = nil
-local ControlModules = {}
-
-local ControlState = {}
-ControlState.Current = nil
-function ControlState:SwitchTo(newControl)
-	if ControlState.Current == newControl then return end
-	
-	if ControlState.Current then
-		ControlState.Current:Disable()
-	end
-	
-	ControlState.Current = newControl
-	
-	if ControlState.Current then
-		ControlState.Current:Enable()
-	end
-end
-
-function ControlState:IsTouchJumpModuleUsed()
-	return isJumpEnabled
-end
-
-local MasterControl = require(script:WaitForChild('MasterControl'))
---MasterControl needs access to ControlState in order to be able to fully enable and disable control
-MasterControl.ControlState = ControlState
-
-local DynamicThumbstickModule = require(script.MasterControl:WaitForChild('DynamicThumbstick'))
-local ThumbstickModule = require(script.MasterControl:WaitForChild('Thumbstick'))
-local ThumbpadModule = require(script.MasterControl:WaitForChild('Thumbpad'))
-local DPadModule = require(script.MasterControl:WaitForChild('DPad'))
-local DefaultModule = ControlModules.Thumbstick
-local TouchJumpModule = require(script.MasterControl:WaitForChild('TouchJump'))
-local ClickToMoveModule = FFlagUserNoCameraClickToMove and require(script.MasterControl:WaitForChild('ClickToMoveController')) or nil
-
-MasterControl.TouchJumpModule = TouchJumpModule
-local VRNavigationModule = require(script.MasterControl:WaitForChild('VRNavigation'))
-local keyboardModule = require(script.MasterControl:WaitForChild('KeyboardMovement'))
-ControlModules.Gamepad = require(script.MasterControl:WaitForChild('Gamepad'))
-
-function getTouchModule()
-
-	local module = nil
-	if not IsUserChoice then
-		if DynamicThumbstickAvailable and DevMovementMode == Enum.DevTouchMovementMode.DynamicThumbstick then
-			module = DynamicThumbstickModule
-			isJumpEnabled = true
-		elseif DevMovementMode == Enum.DevTouchMovementMode.Thumbstick then
-			module = ThumbstickModule
-			isJumpEnabled = true
-		elseif DevMovementMode == Enum.DevTouchMovementMode.Thumbpad then
-			module = ThumbpadModule
-			isJumpEnabled = true
-		elseif DevMovementMode == Enum.DevTouchMovementMode.DPad then
-			module = DPadModule
-			isJumpEnabled = false
-		elseif DevMovementMode == Enum.DevTouchMovementMode.ClickToMove then
-			if FFlagUserNoCameraClickToMove then
-				module = ClickToMoveModule
-				isJumpEnabled = false -- TODO: What should this be, true or false?
-			else
-				module = nil
+local function OnHumanoidSeated(active, currentSeatPart)
+	if active then
+		if currentSeatPart and currentSeatPart:IsA("VehicleSeat") then
+			if not vehicleController then
+				vehicleController = VehicleController.new()
 			end
-		elseif DevMovementMode == Enum.DevTouchMovementMode.Scriptable then
-			module = nil
+			vehicleController:Enable(true, currentSeatPart)
 		end
 	else
-		if DynamicThumbstickAvailable and UserMovementMode == Enum.TouchMovementMode.DynamicThumbstick then
-			module = DynamicThumbstickModule
-			isJumpEnabled = true
-		elseif UserMovementMode == Enum.TouchMovementMode.Default or UserMovementMode == Enum.TouchMovementMode.Thumbstick then
-			module = ThumbstickModule
-			isJumpEnabled = true
-		elseif UserMovementMode == Enum.TouchMovementMode.Thumbpad then
-			module = ThumbpadModule
-			isJumpEnabled = true
-		elseif UserMovementMode == Enum.TouchMovementMode.DPad then
-			module = DPadModule
-			isJumpEnabled = false
-		elseif UserMovementMode == Enum.TouchMovementMode.ClickToMove then
-			if FFlagUserNoCameraClickToMove then
-				module = ClickToMoveModule
-				isJumpEnabled = false -- TODO: What should this be, true or false?
-			else
-				module = nil
-			end
+		if vehicleController then
+			vehicleController:Enable(false, currentSeatPart)
 		end
 	end
-	return module
 end
 
-function setJumpModule(isEnabled)
-	if not isEnabled then
-		TouchJumpModule:Disable()
-	elseif ControlState.Current == ControlModules.Touch then
-		TouchJumpModule:Enable()
+local function OnCharacterAdded(char)
+	humanoid = char:FindFirstChildOfClass("Humanoid")
+	while not humanoid do
+		char.ChildAdded:wait()
+		humanoid = char:FindFirstChildOfClass("Humanoid")
 	end
+
+	if humanoidSeatedConn then
+		humanoidSeatedConn:Disconnect()
+		humanoidSeatedConn = nil
+	end
+	humanoidSeatedConn = humanoid.Seated:connect(OnHumanoidSeated)
 end
 
-function setClickToMove()
-	if DevMovementMode == Enum.DevTouchMovementMode.ClickToMove or DevMovementMode == Enum.DevComputerMovementMode.ClickToMove or
-		UserMovementMode == Enum.ComputerMovementMode.ClickToMove or UserMovementMode == Enum.TouchMovementMode.ClickToMove then
-		if lastInputType == Enum.UserInputType.Touch then
-			ClickToMoveTouchControls = ControlState.Current
+local function OnCharacterRemoving(char)
+	humanoid = nil
+end
+
+-- Helper function to lazily instantiate a controller if it does not yet exist,
+-- disable the active controller if it is different from the on being switched to,
+-- and then enable the requested controller. The argument to this function must be
+-- a reference to one of the control modules, i.e. Keyboard, Gamepad, etc.
+local function SwitchToController(controlModule)
+	if not controlModule then
+		if activeController then
+			activeController:Enable(false)
 		end
-	elseif ClickToMoveTouchControls then
-		ClickToMoveTouchControls:Disable()
-		ClickToMoveTouchControls = nil
-	end
-end
-
-ControlModules.Touch = {}
-ControlModules.Touch.Current = nil
-ControlModules.Touch.LocalPlayerChangedCon = nil
-ControlModules.Touch.GameSettingsChangedCon = nil
-
-function ControlModules.Touch:RefreshControlStyle()
-	if ControlModules.Touch.Current then
-		ControlModules.Touch.Current:Disable()
-	end
-	setJumpModule(false)
-	TouchJumpModule:Disable()
-	ControlModules.Touch:Enable()
-end
-function ControlModules.Touch:DisconnectEvents()
-	if ControlModules.Touch.LocalPlayerChangedCon then
-		ControlModules.Touch.LocalPlayerChangedCon:disconnect()
-		ControlModules.Touch.LocalPlayerChangedCon = nil
-	end
-	if ControlModules.Touch.GameSettingsChangedCon then
-		ControlModules.Touch.GameSettingsChangedCon:disconnect()
-		ControlModules.Touch.GameSettingsChangedCon = nil
-	end
-end
-function ControlModules.Touch:Enable()
-	DevMovementMode = LocalPlayer.DevTouchMovementMode
-	IsUserChoice = DevMovementMode == Enum.DevTouchMovementMode.UserChoice
-	if IsUserChoice then
-		UserMovementMode = GameSettings.TouchMovementMode
-	end
-		
-	local newModuleToEnable = getTouchModule()
-	if newModuleToEnable then
-		setClickToMove()
-		setJumpModule(isJumpEnabled)
-		
-		newModuleToEnable:Enable()
-		ControlModules.Touch.Current = newModuleToEnable
-				
-		if isJumpEnabled then TouchJumpModule:Enable() end
-	end
-	
-	-- This being within the above if statement was causing issues with ClickToMove, which isn't a module within this script.
-	ControlModules.Touch:DisconnectEvents()
-	ControlModules.Touch.LocalPlayerChangedCon = LocalPlayer:GetPropertyChangedSignal("DevTouchMovementMode"):connect(function()
-		ControlModules.Touch:RefreshControlStyle()
-	end)
-	ControlModules.Touch.GameSettingsChangedCon = GameSettings:GetPropertyChangedSignal("TouchMovementMode"):connect(function()
-		ControlModules.Touch:RefreshControlStyle()
-	end)
-end
-function ControlModules.Touch:Disable()
-	ControlModules.Touch:DisconnectEvents()
-	
-	local newModuleToDisable = getTouchModule()
-	
-	if newModuleToDisable == ThumbstickModule or
-		newModuleToDisable == DPadModule or
-		newModuleToDisable == ThumbpadModule or
-		newModuleToDisable == DynamicThumbstickModule then
-			newModuleToDisable:Disable()
-			setJumpModule(false)
-			TouchJumpModule:Disable()
-	end
-	
-	-- UserMovementMode will still have the previous value at this point
-	if FFlagUserNoCameraClickToMove and UserMovementMode == Enum.ComputerMovementMode.ClickToMove then
-		ClickToMoveModule:Disable()
-	end
-end
-
-local function getKeyboardModule()
-	-- NOTE: Click to move still uses keyboard. Leaving cases in case this ever changes.
-	local whichModule = nil
-	if not IsUserChoice then
-		if DevMovementMode == Enum.DevComputerMovementMode.KeyboardMouse then
-			whichModule = keyboardModule
-		elseif DevMovementMode == Enum.DevComputerMovementMode.ClickToMove then
-			whichModule = keyboardModule
-		end 
+		activeController = nil
+		activeControlModule = nil
 	else
-		if UserMovementMode == Enum.ComputerMovementMode.KeyboardMouse or UserMovementMode == Enum.ComputerMovementMode.Default then
-			whichModule = keyboardModule
-		elseif UserMovementMode == Enum.ComputerMovementMode.ClickToMove then
-			whichModule = keyboardModule
+		if not controllers[controlModule] then
+			controllers[controlModule] = controlModule.new()
 		end
-	end
 
-	return whichModule
-end
-
-ControlModules.Keyboard = {}
-function ControlModules.Keyboard:RefreshControlStyle()
-	ControlModules.Keyboard:Disable()
-	ControlModules.Keyboard:Enable()
-end
-function ControlModules.Keyboard:Enable()
-	DevMovementMode = LocalPlayer.DevComputerMovementMode
-	IsUserChoice = DevMovementMode == Enum.DevComputerMovementMode.UserChoice
-	if IsUserChoice then
-		UserMovementMode = GameSettings.ComputerMovementMode
-	end
-		
-	local newModuleToEnable = getKeyboardModule()
-	if newModuleToEnable then
-		newModuleToEnable:Enable()
-	end
-	
-	if FFlagUserNoCameraClickToMove and UserMovementMode == Enum.ComputerMovementMode.ClickToMove then
-		ClickToMoveModule:Enable()
-	end
-	
-	ControlModules.Keyboard:DisconnectEvents()
-	ControlModules.Keyboard.LocalPlayerChangedCon = LocalPlayer.Changed:connect(function(property)
-		if property == 'DevComputerMovementMode' then
-			ControlModules.Keyboard:RefreshControlStyle()
-		end
-	end)
-	
-	ControlModules.Keyboard.GameSettingsChangedCon = GameSettings.Changed:connect(function(property)
-		if property == 'ComputerMovementMode' then
-			ControlModules.Keyboard:RefreshControlStyle()
-		end
-	end)
-end
-function ControlModules.Keyboard:DisconnectEvents()
-	if ControlModules.Keyboard.LocalPlayerChangedCon then
-		ControlModules.Keyboard.LocalPlayerChangedCon:disconnect()
-		ControlModules.Keyboard.LocalPlayerChangedCon = nil
-	end
-	if ControlModules.Keyboard.GameSettingsChangedCon then
-		ControlModules.Keyboard.GameSettingsChangedCon:disconnect()
-		ControlModules.Keyboard.GameSettingsChangedCon = nil
-	end
-end
-function ControlModules.Keyboard:Disable()
-	ControlModules.Keyboard:DisconnectEvents()
-	local newModuleToDisable = getKeyboardModule()
-	if newModuleToDisable then
-		newModuleToDisable:Disable()
-	end
-	
-	-- UserMovementMode will still be set to previous movement type
-	if FFlagUserNoCameraClickToMove and UserMovementMode == Enum.ComputerMovementMode.ClickToMove then
-		ClickToMoveModule:Disable()
-	end
-end
-
-ControlModules.VRNavigation = {}
-
-function ControlModules.VRNavigation:Enable()
-	VRNavigationModule:Enable()
-end
-
-function ControlModules.VRNavigation:Disable()
-	VRNavigationModule:Disable()
-end
-
-if not FFlagUserNoCameraClickToMove and IsTouchDevice then
-	BindableEvent_OnFailStateChanged = script.Parent:WaitForChild("OnClickToMoveFailStateChange")
-end
-
--- not used, but needs to be required
-local VehicleController = require(script.MasterControl:WaitForChild('VehicleController'))
-
-
---[[ Initialization/Setup ]]--
-local function createTouchGuiContainer()
-	if TouchGui then TouchGui:Destroy() end
-	
-	-- Container for all touch device guis
-	TouchGui = Instance.new('ScreenGui')
-	TouchGui.Name = "TouchGui"
-	TouchGui.ResetOnSpawn = false
-	TouchGui.Parent = PlayerGui
-	
-	TouchControlFrame = Instance.new('Frame')
-	TouchControlFrame.Name = "TouchControlFrame"
-	TouchControlFrame.Size = UDim2.new(1, 0, 1, 0)
-	TouchControlFrame.BackgroundTransparency = 1
-	TouchControlFrame.Parent = TouchGui
-	
-	ThumbstickModule:Create(TouchControlFrame)
-	DPadModule:Create(TouchControlFrame)
-	ThumbpadModule:Create(TouchControlFrame)
-	TouchJumpModule:Create(TouchControlFrame)
-	DynamicThumbstickModule:Create(TouchControlFrame)
-end
-
---[[ Settings Changed Connections ]]--
-LocalPlayer.Changed:connect(function(property)
-	if lastInputType == Enum.UserInputType.Touch and property == 'DevTouchMovementMode' then
-		ControlState:SwitchTo(ControlModules.Touch)
-	elseif UserInputService.KeyboardEnabled and property == 'DevComputerMovementMode' then
-		ControlState:SwitchTo(ControlModules.Keyboard)
-	end
-end)
-
-GameSettings.Changed:connect(function(property)
-	if not IsUserChoice then return end
-	if property == 'TouchMovementMode' or property == 'ComputerMovementMode' then
-		UserMovementMode = GameSettings[property]
-		if property == 'TouchMovementMode' then
-			ControlState:SwitchTo(ControlModules.Touch)
-		elseif property == 'ComputerMovementMode' then
-			ControlState:SwitchTo(ControlModules.Keyboard)
-		end
-	end
-end)
-
---[[ Touch Events ]]--
-UserInputService.Changed:connect(function(property)
-	if property == 'ModalEnabled' then
-		IsModalEnabled = UserInputService.ModalEnabled
-
-		if lastInputType == Enum.UserInputType.Touch then
-			if ControlState.Current == ControlModules.Touch and IsModalEnabled then
-				ControlState:SwitchTo(nil)
-			elseif ControlState.Current == nil and not IsModalEnabled then
-				ControlState:SwitchTo(ControlModules.Touch)
+		if activeController ~= controllers[controlModule] then
+			if activeController then
+				activeController:Enable(false)
 			end
-		end
-	end
-end)
-
-if FFlagUserNoCameraClickToMove then
-	BindableEvent_OnFailStateChanged = MasterControl:GetClickToMoveFailStateChanged()
-end
-if BindableEvent_OnFailStateChanged then
-	BindableEvent_OnFailStateChanged.Event:connect(function(isOn)
-		if lastInputType == Enum.UserInputType.Touch and ClickToMoveTouchControls then
-			if isOn then
-				ControlState:SwitchTo(ClickToMoveTouchControls)
+			activeController = controllers[controlModule]
+			activeControlModule = controlModule -- Only used to check if controller switch is necessary
+			if touchControlFrame then
+				activeController:Enable(true, touchControlFrame)
 			else
-				ControlState:SwitchTo(nil)
+				activeController:Enable(true)
+			end
+			if touchControlFrame and (activeControlModule == TouchThumbpad
+									or activeControlModule == TouchThumbstick
+									or activeControlModule == ClickToMove
+									or activeControlModule == DynamicThumbstick) then
+				touchJumpController = controllers[TouchJump]
+				if not touchJumpController then
+					touchJumpController = TouchJump.new()
+				end
+				touchJumpController:Enable(true, touchControlFrame)
+			else
+				if touchJumpController then
+					touchJumpController:Enable(false)
+				end
 			end
 		end
-	end)
+	end
 end
 
-local switchToInputType = function(newLastInputType)
+local function OnLastInputTypeChanged(newLastInputType)
+	if lastInputType == newLastInputType then
+		warn("LastInputType Change listener called with current type.")
+	end
 	lastInputType = newLastInputType
-	
-	if VRService.VREnabled then
-		ControlState:SwitchTo(ControlModules.VRNavigation)
-		return
-	end
 
 	if lastInputType == Enum.UserInputType.Touch then
-				ControlState:SwitchTo(ControlModules.Touch)
-	elseif lastInputType == Enum.UserInputType.Keyboard or
-			lastInputType == Enum.UserInputType.MouseButton1 or
-			lastInputType == Enum.UserInputType.MouseButton2 or
-			lastInputType == Enum.UserInputType.MouseButton3 or
-			lastInputType == Enum.UserInputType.MouseWheel or
-			lastInputType == Enum.UserInputType.MouseMovement  then
-				ControlState:SwitchTo(ControlModules.Keyboard)
-	elseif lastInputType == Enum.UserInputType.Gamepad1 or
-			lastInputType == Enum.UserInputType.Gamepad2 or
-			lastInputType == Enum.UserInputType.Gamepad3 or
-			lastInputType == Enum.UserInputType.Gamepad4 then
-				ControlState:SwitchTo(ControlModules.Gamepad)
-	end
-end
-
-if IsTouchDevice then
-	createTouchGuiContainer()
-end
-
-MasterControl:Init()
-
-UserInputService.GamepadDisconnected:connect(function(gamepadEnum)
-	local connectedGamepads = UserInputService:GetConnectedGamepads()
-	if #connectedGamepads > 0 then return end
-	
-	if not VRService.VREnabled then
-		if UserInputService.KeyboardEnabled then
-			ControlState:SwitchTo(ControlModules.Keyboard)
-		elseif IsTouchDevice then
-			ControlState:SwitchTo(ControlModules.Touch)
+		-- TODO: Check if touch module already active
+		local touchModule, success = SelectTouchModule()
+		if success then
+			while not touchControlFrame do
+				wait()
+			end
+			SwitchToController(touchModule)
+		end
+	else
+		local computerModule = computerInputTypeToModuleMap[lastInputType]
+		if computerModule then
+			SwitchToController(computerModule)
 		end
 	end
-end)
+end
 
-UserInputService.GamepadConnected:connect(function(gamepadEnum)
-	if not VRService.VREnabled then
-		ControlState:SwitchTo(ControlModules.Gamepad)
+-- Called when any relevant values of GameSettings or LocalPlayer change, forcing re-evalulation of
+-- current control scheme
+local function OnComputerMovementModeChange()
+	local controlModule, success =  SelectComputerMovementModule()
+	if success then
+		SwitchToController(controlModule)
 	end
-end)
+end
 
-switchToInputType(UserInputService:GetLastInputType())
-UserInputService.LastInputTypeChanged:connect(switchToInputType)
-
-VRService:GetPropertyChangedSignal("VREnabled"):Connect(function()	
-	if VRService.VREnabled then
-		ControlState:SwitchTo(ControlModules.VRNavigation)
+local function OnTouchMovementModeChange()
+	local touchModule, success = SelectTouchModule()
+	if success then
+		while not touchControlFrame do
+			wait()
+		end
+		SwitchToController(touchModule)
 	end
-end)
+end
+
+Players.LocalPlayer.CharacterAdded:Connect(OnCharacterAdded)
+Players.LocalPlayer.CharacterRemoving:Connect(OnCharacterRemoving)
+if Players.LocalPlayer.Character then
+	OnCharacterAdded(Players.LocalPlayer.Character)
+end
+
+RunService:BindToRenderStep("ControlScriptRenderstep", Enum.RenderPriority.Input.Value, OnRenderStepped)
+
+UserInputService.LastInputTypeChanged:Connect(OnLastInputTypeChanged)
+
+local propertyChangeListeners = {
+	GameSettings:GetPropertyChangedSignal("TouchMovementMode"):Connect(OnTouchMovementModeChange),
+	Players.LocalPlayer:GetPropertyChangedSignal("DevTouchMovementMode"):Connect(OnTouchMovementModeChange),
+
+	GameSettings:GetPropertyChangedSignal("ComputerMovementMode"):Connect(OnComputerMovementModeChange),
+	Players.LocalPlayer:GetPropertyChangedSignal("DevComputerMovementMode"):Connect(OnComputerMovementModeChange),
+}
+
+--[[ Touch Device UI ]]--
+local PlayerGui = nil
+local touchGui = nil
+local playerGuiAddedConn = nil
+
+local function createTouchGuiContainer()
+	if touchGui then touchGui:Destroy() end
+
+	-- Container for all touch device guis
+	touchGui = Instance.new('ScreenGui')
+	touchGui.Name = "TouchGui"
+	touchGui.ResetOnSpawn = false
+
+	touchControlFrame = Instance.new("Frame")
+	touchControlFrame.Name = "TouchControlFrame"
+	touchControlFrame.Size = UDim2.new(1, 0, 1, 0)
+	touchControlFrame.BackgroundTransparency = 1
+	touchControlFrame.Parent = touchGui
+
+	touchGui.Parent = PlayerGui
+end
+
+if UserInputService.TouchEnabled then
+	PlayerGui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	if PlayerGui then
+		createTouchGuiContainer()
+		OnLastInputTypeChanged(UserInputService:GetLastInputType())
+	else
+		playerGuiAddedConn = Players.LocalPlayer.ChildAdded:Connect(function(child)
+			if child:IsA("PlayerGui") then
+				PlayerGui = child
+				createTouchGuiContainer()
+				playerGuiAddedConn:Disconnect()
+				playerGuiAddedConn = nil
+				OnLastInputTypeChanged(UserInputService:GetLastInputType())
+			end
+		end)
+	end
+end
+
+return ControlScript
