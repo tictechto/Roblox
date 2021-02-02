@@ -1,198 +1,235 @@
 --[[
-	// FileName: Gamepad
-	// Written by: jeditkacheff
-	// Description: Implements movement controls for gamepad devices (XBox, PS4, MFi, etc.)
+	Gamepad Character Control - This module handles controlling your avatar using a game console-style controller
+	
+	2018 PlayerScripts Update - AllYourBlox		
 --]]
-local Gamepad = {}
 
-local MasterControl = require(script.Parent)
-
-local Players = game:GetService('Players')
-local RunService = game:GetService('RunService')
-local UserInputService = game:GetService('UserInputService')
-local ContextActionService = game:GetService('ContextActionService')
-local StarterPlayer = game:GetService('StarterPlayer')
-local Settings = UserSettings()
-local GameSettings = Settings.GameSettings
-local currentMoveVector = Vector3.new(0,0,0)
-local activateGamepad = nil
-
-local gamepadConnectedCon = nil
-local gamepadDisconnectedCon = nil
-
-while not Players.LocalPlayer do
-	wait()
-end
-local LocalPlayer = Players.LocalPlayer
+local UserInputService = game:GetService("UserInputService")
+local ContextActionService = game:GetService("ContextActionService")
 
 --[[ Constants ]]--
-local thumbstickDeadzone = 0.22 --raised from 14% on 3/1/16 to accommodate looser XB360 controllers
+local ZERO_VECTOR3 = Vector3.new(0,0,0)
+local NONE = Enum.UserInputType.None
+local thumbstickDeadzone = 0.2
 
-function assignActivateGamepad()
-	local connectedGamepads = UserInputService:GetConnectedGamepads()
-	if #connectedGamepads > 0 then
-		for i = 1, #connectedGamepads do
-			if activateGamepad == nil then
-				activateGamepad = connectedGamepads[i]
-			elseif connectedGamepads[i].Value < activateGamepad.Value then
-				activateGamepad = connectedGamepads[i]
-			end
-		end
-	end
+--[[ The Module ]]--
+local BaseCharacterController = require(script.Parent:WaitForChild("BaseCharacterController"))
+local Gamepad = setmetatable({}, BaseCharacterController)
+Gamepad.__index = Gamepad
+
+function Gamepad.new()
+	print("Instantiating Gamepad Controller")
+	local self = setmetatable(BaseCharacterController.new(), Gamepad)
 	
-	if activateGamepad == nil then -- nothing is connected, at least set up for gamepad1
-		activateGamepad = Enum.UserInputType.Gamepad1
-	end
+	self.forwardValue  = 0
+	self.backwardValue = 0
+	self.leftValue = 0
+	self.rightValue = 0
+	
+	self.activeGamepad = NONE	-- Enum.UserInputType.Gamepad1, 2, 3...
+	self.gamepadConnectedConn = nil
+	self.gamepadDisconnectedConn = nil
+	return self
 end
 
---[[ Public API ]]--
-function Gamepad:Enable()
-	local forwardValue  = 0
-	local backwardValue = 0
-	local leftValue = 0
-	local rightValue = 0
+function Gamepad:Enable(enable)
+	if not UserInputService.GamepadEnabled then
+		return false
+	end
 	
-	local moveFunc = LocalPlayer.Move
-	local gamepadSupports = UserInputService.GamepadSupports
+	if enable == self.enabled then
+		-- Module is already in the state being requested. True is returned here since the module will be in the state
+		-- expected by the code that follows the Enable() call. This makes more sense than returning false to indicate
+		-- no action was necessary. False indicates failure to be in requested/expected state.
+		return true
+	end
 	
-	local controlCharacterGamepad = function(actionName, inputState, inputObject)
-		if inputState == Enum.UserInputState.Cancel then
-			MasterControl:AddToPlayerMovement(-currentMoveVector)
-			currentMoveVector =  Vector3.new(0,0,0)
-			return
+	self.forwardValue  = 0
+	self.backwardValue = 0
+	self.leftValue = 0
+	self.rightValue = 0
+	self.moveVector = ZERO_VECTOR3
+	
+	if enable then
+		self.activeGamepad = self:GetHighestPriorityGamepad()
+		if self.activeGamepad ~= NONE then
+			self:BindContextActions()
+			self:ConnectGamepadConnectionListeners()
+		else
+			-- No connected gamepads, failure to enable
+			return false
 		end
+	else
+		self:UnbindContextActions()
+		self:DisconnectGamepadConnectionListeners()
+		self.activeGamepad = NONE
+	end
+	
+	self.enabled = enable
+	return true
+end
 
-		if activateGamepad ~= inputObject.UserInputType then return end
+-- This function selects the lowest number gamepad from the currently-connected gamepad
+-- and sets it as the active gamepad
+function Gamepad:GetHighestPriorityGamepad()
+	local connectedGamepads = UserInputService:GetConnectedGamepads()
+	local bestGamepad = NONE -- Note that this value is higher than all valid gamepad values
+	for _, gamepad in pairs(connectedGamepads) do
+		if gamepad.Value < bestGamepad.Value then
+			bestGamepad = gamepad
+		end
+	end
+	return bestGamepad
+end
+
+function Gamepad:BindContextActions()
+	
+	if self.activeGamepad == NONE then
+		-- There must be an active gamepad to set up bindings
+		return false
+	end
+	
+	
+	local updateMovement = function(inputState)
+		if inputState == Enum.UserInputState.Cancel then
+			self.moveVector = ZERO_VECTOR3
+		else
+			self.moveVector = Vector3.new(self.leftValue + self.rightValue, 0, self.forwardValue + self.backwardValue)
+		end
+	end
+	
+	-- Note: In the previous version of this code, the movement values were not zeroed-out on UserInputState. Cancel, now they are,
+	-- which fixes them from getting stuck on.
+	local handleMoveForward = function(actionName, inputState, inputObject)			
+		self.forwardValue = (inputState == Enum.UserInputState.Begin) and -1 or 0
+		updateMovement(inputState)
+	end
+	
+	local handleMoveBackward = function(actionName, inputState, inputObject)	
+		self.backwardValue = (inputState == Enum.UserInputState.Begin) and 1 or 0
+		updateMovement(inputState)
+	end
+	
+	local handleMoveLeft = function(actionName, inputState, inputObject)	
+		self.leftValue = (inputState == Enum.UserInputState.Begin) and -1 or 0
+		updateMovement(inputState)
+	end
+	
+	local handleMoveRight = function(actionName, inputState, inputObject)	
+		self.rightValue = (inputState == Enum.UserInputState.Begin) and 1 or 0
+		updateMovement(inputState)
+	end
+	
+	local handleJumpAction = function(actionName, inputState, inputObject)
+		self.isJumping = (inputState == Enum.UserInputState.Begin)
+	end
+	
+	local handleThumbstickInput = function(actionName, inputState, inputObject)
+		if self.activeGamepad ~= inputObject.UserInputType then return end
 		if inputObject.KeyCode ~= Enum.KeyCode.Thumbstick1 then return end
 		
-		if inputObject.Position.magnitude > thumbstickDeadzone then
-			MasterControl:AddToPlayerMovement(-currentMoveVector)
-			currentMoveVector =  Vector3.new(inputObject.Position.X, 0, -inputObject.Position.Y)
-			MasterControl:AddToPlayerMovement(currentMoveVector)
-		else
-			MasterControl:AddToPlayerMovement(-currentMoveVector)
-			currentMoveVector =  Vector3.new(0,0,0)
-		end
-	end
-	
-	local jumpCharacterGamepad = function(actionName, inputState, inputObject)
 		if inputState == Enum.UserInputState.Cancel then
-			MasterControl:SetIsJumping(false)
+			self.moveVector = ZERO_VECTOR3
 			return
 		end
-
-		if activateGamepad ~= inputObject.UserInputType then return end
-		if inputObject.KeyCode ~= Enum.KeyCode.ButtonA then return end
 		
-		MasterControl:SetIsJumping(inputObject.UserInputState == Enum.UserInputState.Begin)
-	end
-	
-	local doDpadMoveUpdate = function(userInputType)
-		if LocalPlayer and LocalPlayer.Character then
-			MasterControl:AddToPlayerMovement(-currentMoveVector)
-			currentMoveVector = Vector3.new(leftValue + rightValue,0,forwardValue + backwardValue)
-			MasterControl:AddToPlayerMovement(currentMoveVector)
+		if inputObject.Position.magnitude > thumbstickDeadzone then
+			self.moveVector  =  Vector3.new(inputObject.Position.X, 0, -inputObject.Position.Y)
+		else
+			self.moveVector = ZERO_VECTOR3
 		end
 	end
 	
-	local moveForwardFunc = function(actionName, inputState, inputObject)
-		if inputState == Enum.UserInputState.End then
-			forwardValue = -1
-		elseif inputState == Enum.UserInputState.Begin or inputState == Enum.UserInputState.Cancel then
-			forwardValue = 0
-		end
-		
-		doDpadMoveUpdate(inputObject.UserInputType)
-	end
+	ContextActionService:BindActivate(self.activeGamepad, Enum.KeyCode.ButtonR2)
+	ContextActionService:BindAction("jumpAction",handleJumpAction, false, Enum.KeyCode.ButtonA)
+	ContextActionService:BindAction("moveThumbstick",handleThumbstickInput, false, Enum.KeyCode.Thumbstick1)
 	
-	local moveBackwardFunc = function(actionName, inputState, inputObject)	
-		if inputState == Enum.UserInputState.End then
-			backwardValue = 1
-		elseif inputState == Enum.UserInputState.Begin or inputState == Enum.UserInputState.Cancel then
-			backwardValue = 0
-		end
-		
-		doDpadMoveUpdate(inputObject.UserInputType)
-	end
-	
-	local moveLeftFunc = function(actionName, inputState, inputObject)	
-		if inputState == Enum.UserInputState.End then
-			leftValue = -1
-		elseif inputState == Enum.UserInputState.Begin or inputState == Enum.UserInputState.Cancel then
-			leftValue = 0
-		end
-		
-		doDpadMoveUpdate(inputObject.UserInputType)
-	end
-	
-	local moveRightFunc = function(actionName, inputState, inputObject)	
-		if inputState == Enum.UserInputState.End then
-			rightValue = 1
-		elseif inputState == Enum.UserInputState.Begin or inputState == Enum.UserInputState.Cancel then
-			rightValue = 0
-		end
-		
-		doDpadMoveUpdate(inputObject.UserInputType)
-	end
-	
-	local function setActivateGamepad()
-		if activateGamepad then
-			ContextActionService:UnbindActivate(activateGamepad, Enum.KeyCode.ButtonR2)
-		end
-		assignActivateGamepad()
-		if activateGamepad then
-			ContextActionService:BindActivate(activateGamepad, Enum.KeyCode.ButtonR2)
-		end
-	end
-	
-	ContextActionService:BindAction("JumpButton",jumpCharacterGamepad, false, Enum.KeyCode.ButtonA)
-	ContextActionService:BindAction("MoveThumbstick",controlCharacterGamepad, false, Enum.KeyCode.Thumbstick1)
-	
-	setActivateGamepad()
-	
-	if not gamepadSupports(UserInputService, activateGamepad, Enum.KeyCode.Thumbstick1) then
-		-- if the gamepad supports thumbsticks, theres no point in having the dpad buttons getting eaten up by these actions
-		ContextActionService:BindAction("forwardDpad", moveForwardFunc, false, Enum.KeyCode.DPadUp)
-		ContextActionService:BindAction("backwardDpad", moveBackwardFunc, false, Enum.KeyCode.DPadDown)
-		ContextActionService:BindAction("leftDpad", moveLeftFunc, false, Enum.KeyCode.DPadLeft)
-		ContextActionService:BindAction("rightDpad", moveRightFunc, false, Enum.KeyCode.DPadRight)
-	end
-	
-	gamepadConnectedCon = UserInputService.GamepadDisconnected:connect(function(gamepadEnum)
-		if activateGamepad ~= gamepadEnum then return end
-		
-		MasterControl:AddToPlayerMovement(-currentMoveVector)
-		currentMoveVector = Vector3.new(0,0,0)
-		
-		activateGamepad = nil
-		setActivateGamepad()
-	end)
-
-	gamepadDisconnectedCon = UserInputService.GamepadConnected:connect(function(gamepadEnum)
-		if activateGamepad == nil then 
-			setActivateGamepad()
-		end
-	end)
+	return true
 end
 
-function Gamepad:Disable()
+function Gamepad:UnbindContextActions()
+	if self.activeGamepad ~= NONE then
+		ContextActionService:UnbindActivate(self.activeGamepad, Enum.KeyCode.ButtonR2)
+	end
+	ContextActionService:UnbindAction("moveThumbstick")
+	ContextActionService:UnbindAction("jumpAction")
+end
+
+function Gamepad:OnNewGamepadConnected()
+	-- A new gamepad has been connected.
+	local bestGamepad = self:GetHighestPriorityGamepad()
+
+	if bestGamepad == self.activeGamepad then
+		-- A new gamepad was connected, but our active gamepad is not changing
+		return
+	end
 	
-	ContextActionService:UnbindAction("forwardDpad")
-	ContextActionService:UnbindAction("backwardDpad")
-	ContextActionService:UnbindAction("leftDpad")
-	ContextActionService:UnbindAction("rightDpad")
+	if bestGamepad == NONE then
+		-- There should be an active gamepad when GamepadConnected fires, so this should not
+		-- normally be hit. If there is no active gamepad, unbind actions but leave
+		-- the module enabled and continue to listen for a new gamepad connection.
+		warn("Gamepad:OnNewGamepadConnected found no connected gamepads")
+		self:UnbindContextActions()
+		return
+	end
 	
-	ContextActionService:UnbindAction("MoveThumbstick")
-	ContextActionService:UnbindAction("JumpButton")
-	ContextActionService:UnbindActivate(activateGamepad, Enum.KeyCode.ButtonR2)
+	if self.activeGamepad ~= NONE then
+		-- Switching from one active gamepad to another
+		ContextActionService:UnbindActivate(self.activeGamepad, Enum.KeyCode.ButtonR2)
+	end
 	
-	if gamepadConnectedCon then gamepadConnectedCon:disconnect() end
-	if gamepadDisconnectedCon then gamepadDisconnectedCon:disconnect() end
+	self.activeGamepad = bestGamepad
+	ContextActionService:BindActivate(self.activeGamepad, Enum.KeyCode.ButtonR2)
+end
+
+function Gamepad:OnCurrentGamepadDisconnected()
+	if self.activeGamepad ~= NONE then
+		ContextActionService:UnbindActivate(self.activeGamepad, Enum.KeyCode.ButtonR2)
+	end
 	
-	activateGamepad = nil
-	MasterControl:AddToPlayerMovement(-currentMoveVector)
-	currentMoveVector = Vector3.new(0,0,0)
-	MasterControl:SetIsJumping(false)
+	local bestGamepad = self:GetHighestPriorityGamepad()
+
+	if self.activeGamepad ~= NONE and bestGamepad == self.activeGamepad then
+		warn("Gamepad:OnCurrentGamepadDisconnected found the supposedly disconnected gamepad in connectedGamepads.")
+		self:UnbindContextActions()
+		self.activeGamepad = NONE
+		return
+	end	
+	
+	if bestGamepad == NONE then
+		-- No active gamepad, unbinding actions but leaving gamepad connection listener active
+		self:UnbindContextActions()
+		self.activeGamepad = NONE
+	else
+		-- Set new gamepad as active and bind to tool activation
+		self.activeGamepad = bestGamepad
+		ContextActionService:BindActivate(self.activeGamepad, Enum.KeyCode.ButtonR2)
+	end
+end
+
+function Gamepad:ConnectGamepadConnectionListeners()
+	self.gamepadConnectedConn = UserInputService.GamepadConnected:Connect(function(gamepadEnum)
+		self:OnNewGamepadConnected()
+	end)
+	
+	self.gamepadDisconnectedConn = UserInputService.GamepadDisconnected:Connect(function(gamepadEnum)
+		if self.activeGamepad == gamepadEnum then
+			self:OnCurrentGamepadDisconnected()
+		end
+	end)
+
+end
+
+function Gamepad:DisconnectGamepadConnectionListeners()
+	if self.gamepadConnectedConn then
+		self.gamepadConnectedConn:Disconnect()
+		self.gamepadConnectedConn = nil
+	end
+	
+	if self.gamepadDisconnectedConn then
+		self.gamepadDisconnectedConn:Disconnect()
+		self.gamepadDisconnectedConn = nil
+	end
 end
 
 return Gamepad

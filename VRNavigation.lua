@@ -1,3 +1,8 @@
+
+--[[
+
+--]]
+
 local VRService = game:GetService("VRService")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
@@ -6,54 +11,78 @@ local PathfindingService = game:GetService("PathfindingService")
 local ContextActionService = game:GetService("ContextActionService")
 local StarterGui = game:GetService("StarterGui")
 
-local MasterControl = require(script.Parent)
+--local MasterControl = require(script.Parent)
 local PathDisplay = nil
 local LocalPlayer = Players.LocalPlayer
 
-local VRNavigation = {}
-
+--[[ Constants ]]--
 local RECALCULATE_PATH_THRESHOLD = 4
 local NO_PATH_THRESHOLD = 12
 local MAX_PATHING_DISTANCE = 200
 local POINT_REACHED_THRESHOLD = 1
 local STOPPING_DISTANCE = 4
 local OFFTRACK_TIME_THRESHOLD = 2
-
-local ZERO_VECTOR3 = Vector3.new(0, 0, 0)
-local XZ_VECTOR3 = Vector3.new(1, 0, 1)
-
 local THUMBSTICK_DEADZONE = 0.22
 
-local navigationRequestedConn = nil
-local heartbeatConn = nil
+local ZERO_VECTOR3 = Vector3.new(0,0,0)
+local XZ_VECTOR3 = Vector3.new(1,0,1)
 
-local currentDestination = nil
-local currentPath = nil
-local currentPoints = nil
-local currentPointIdx = 0
-local currentMoveVector = Vector3.new(0, 0, 0)
+--[[ Utility Functions ]]--
+local function IsFinite(num)
+	return num == num and num ~= 1/0 and num ~= -1/0
+end
 
-local expectedTimeToNextPoint = 0
-local timeReachedLastPoint = tick()
+local function IsFiniteVector3(vec3)
+	return IsFinite(vec3.x) and IsFinite(vec3.y) and IsFinite(vec3.z)
+end
 
 local movementUpdateEvent = Instance.new("BindableEvent")
 movementUpdateEvent.Name = "MovementUpdate"
 movementUpdateEvent.Parent = script
 
 coroutine.wrap(function()
-	local PathDisplayModule = script.Parent.Parent:WaitForChild("PathDisplay")
+	local PathDisplayModule = script.Parent:WaitForChild("PathDisplay")
 	if PathDisplayModule then
 		PathDisplay = require(PathDisplayModule)
 	end
 end)()
 
-local function setLaserPointerMode(mode)
+
+--[[ The Class ]]--
+local BaseCharacterController = require(script.Parent:WaitForChild("BaseCharacterController"))
+local VRNavigation = setmetatable({}, BaseCharacterController)
+VRNavigation.__index = VRNavigation
+
+function VRNavigation.new()
+	local self = setmetatable(BaseCharacterController.new(), VRNavigation)
+	
+	self.navigationRequestedConn = nil
+	self.heartbeatConn = nil
+	
+	self.currentDestination = nil
+	self.currentPath = nil
+	self.currentPoints = nil
+	self.currentPointIdx = 0
+	
+	self.expectedTimeToNextPoint = 0
+	self.timeReachedLastPoint = tick()
+	self.moving = false
+	
+	self.isJumpBound = false
+	self.moveLatch = false	
+
+	self.userCFrameEnabledConn = nil
+	
+	return self
+end
+
+function VRNavigation:SetLaserPointerMode(mode)
 	pcall(function()
 		StarterGui:SetCore("VRLaserPointerMode", mode)
 	end)
 end
 
-local function getLocalHumanoid()
+function VRNavigation:GetLocalHumanoid()
 	local character = LocalPlayer.Character
 	if not character then
 		return
@@ -67,53 +96,45 @@ local function getLocalHumanoid()
 	return nil
 end
 
-local function hasBothHandControllers()
+function VRNavigation:HasBothHandControllers()
 	return VRService:GetUserCFrameEnabled(Enum.UserCFrame.RightHand) and VRService:GetUserCFrameEnabled(Enum.UserCFrame.LeftHand)
 end
 
-local function hasAnyHandControllers()
+function VRNavigation:HasAnyHandControllers()
 	return VRService:GetUserCFrameEnabled(Enum.UserCFrame.RightHand) or VRService:GetUserCFrameEnabled(Enum.UserCFrame.LeftHand)
 end
 
-local function isMobileVR()
+function VRNavigation:IsMobileVR()
 	return UserInputService.TouchEnabled
 end
 
-local function hasGamepad()
+function VRNavigation:HasGamepad()
 	return UserInputService.GamepadEnabled
 end
 
-local function shouldUseNavigationLaser()
+function VRNavigation:ShouldUseNavigationLaser()
 	--Places where we use the navigation laser:
 	-- mobile VR with any number of hands tracked
 	-- desktop VR with only one hand tracked
 	-- desktop VR with no hands and no gamepad (i.e. with Oculus remote?)
 	--using an Xbox controller with a desktop VR headset means no laser since the user has a thumbstick.
 	--in the future, we should query thumbstick presence with a features API
-	if isMobileVR() then
+	if self:IsMobileVR() then
 		return true		
 	else
-		if hasBothHandControllers() then
+		if self:HasBothHandControllers() then
 			return false
 		end
-		if not hasAnyHandControllers() then
-			return not hasGamepad()
+		if not self:HasAnyHandControllers() then
+			return not self:HasGamepad()
 		end
 		return true
 	end
 end
 
-local function IsFinite(num)
-	return num == num and num ~= 1/0 and num ~= -1/0
-end
 
-local function IsFiniteVector3(vec3)
-	return IsFinite(vec3.x) and IsFinite(vec3.y) and IsFinite(vec3.z)
-end
 
-local moving = false
-
-local function startFollowingPath(newPath)
+function VRNavigation:StartFollowingPath(newPath)
 	currentPath = newPath
 	currentPoints = currentPath:GetPointCoordinates()
 	currentPointIdx = 1
@@ -121,22 +142,22 @@ local function startFollowingPath(newPath)
 	
 	timeReachedLastPoint = tick()
 	
-	local humanoid = getLocalHumanoid()
+	local humanoid = self:GetLocalHumanoid()
 	if humanoid and humanoid.Torso and #currentPoints >= 1 then
 		local dist = (currentPoints[1] - humanoid.Torso.Position).magnitude
 		expectedTimeToNextPoint = dist / humanoid.WalkSpeed
 	end
 	
-	movementUpdateEvent:Fire("targetPoint", currentDestination)	
+	movementUpdateEvent:Fire("targetPoint", self.currentDestination)	
 end
 
-local function goToPoint(point)
+function VRNavigation:GoToPoint(point)
 	currentPath = true
 	currentPoints = { point }
 	currentPointIdx = 1
 	moving = true
 
-	local humanoid = getLocalHumanoid()
+	local humanoid = self:GetLocalHumanoid()
 	local distance = (humanoid.Torso.Position - point).magnitude	
 	local estimatedTimeRemaining = distance / humanoid.WalkSpeed 
 	
@@ -146,16 +167,16 @@ local function goToPoint(point)
 	movementUpdateEvent:Fire("targetPoint", point)
 end
 
-local function stopFollowingPath()
+function VRNavigation:StopFollowingPath()
 	currentPath = nil
 	currentPoints = nil
 	currentPointIdx = 0
 	moving = false
-	MasterControl:AddToPlayerMovement(-currentMoveVector)
-	currentMoveVector = ZERO_VECTOR3
+	--MasterControl:AddToPlayerMovement(-self.moveVector)
+	self.moveVector = ZERO_VECTOR3
 end
 
-local function tryComputePath(startPos, destination)
+function VRNavigation:TryComputePath(startPos, destination)
 	local numAttempts = 0
 	local newPath = nil
 	
@@ -182,128 +203,125 @@ local function tryComputePath(startPos, destination)
 	return newPath
 end
 
-local function onNavigationRequest(destinationCFrame, requestedWith)
+function VRNavigation:OnNavigationRequest(destinationCFrame, inputUserCFrame )
 	local destinationPosition = destinationCFrame.p
-	local lastDestination = currentDestination
+	local lastDestination = self.currentDestination
 
 	if not IsFiniteVector3(destinationPosition) then
 		return
 	end
 	
-	currentDestination = destinationPosition
+	self.currentDestination = destinationPosition
 		
-	local humanoid = getLocalHumanoid()
+	local humanoid = self:GetLocalHumanoid()
 	if not humanoid or not humanoid.Torso then
 		return
 	end
 		
 	local currentPosition = humanoid.Torso.Position
-	local distanceToDestination = (currentDestination - currentPosition).magnitude
+	local distanceToDestination = (self.currentDestination - currentPosition).magnitude
 		
 	if distanceToDestination < NO_PATH_THRESHOLD then
-		goToPoint(currentDestination)
+		self:GoToPoint(self.currentDestination)
 		return
 	end		
 		
-	if not lastDestination or (currentDestination - lastDestination).magnitude > RECALCULATE_PATH_THRESHOLD then
-		local newPath = tryComputePath(currentPosition, currentDestination)	
+	if not lastDestination or (self.currentDestination - lastDestination).magnitude > RECALCULATE_PATH_THRESHOLD then
+		local newPath = self:TryComputePath(currentPosition, self.currentDestination)	
 		if newPath then
-			startFollowingPath(newPath)
+			self:StartFollowingPath(newPath)
 			if PathDisplay then
-				PathDisplay.setCurrentPoints(currentPoints)
+				PathDisplay.setCurrentPoints(self.currentPoints)
 				PathDisplay.renderPath()
 			end
 		else
-			stopFollowingPath()
+			self:StopFollowingPath()
 			if PathDisplay then
 				PathDisplay.clearRenderedPath()
 			end
 		end
 	else
 		if moving then
-			currentPoints[#currentPoints] = currentDestination
+			self.currentPoints[#currentPoints] = self.currentDestination
 		else
-			goToPoint(currentDestination)
+			self:GoToPoint(self.currentDestination)
 		end
 	end
 end
 
-local isJumpBound = false
-local function onJumpAction(actionName, inputState, inputObj)
+function VRNavigation:OnJumpAction(actionName, inputState, inputObj)
 	if inputState == Enum.UserInputState.Begin then
-		MasterControl:DoJump()
+		--MasterControl:DoJump()
+		self.isJumping = true
 	end
 end
-
-local function bindJumpAction(active)
+function VRNavigation:BindJumpAction(active)
 	if active then
-		if not isJumpBound then
-			isJumpBound = true
-			ContextActionService:BindAction("VRJumpAction", onJumpAction, false, Enum.KeyCode.ButtonA)
+		if not self.isJumpBound then
+			self.isJumpBound = true
+			ContextActionService:BindAction("VRJumpAction", (function() self:OnJumpAction() end), false, Enum.KeyCode.ButtonA)
 		end
 	else
-		if isJumpBound then
-			isJumpBound = false
+		if self.isJumpBound then
+			self.isJumpBound = false
 			ContextActionService:UnbindAction("VRJumpAction")
 		end
 	end
 end
 
-local moveLatch = false
-local controlCharacterGamepad = function(actionName, inputState, inputObject)
+function VRNavigation:ControlCharacterGamepad(actionName, inputState, inputObject)
 	if inputObject.KeyCode ~= Enum.KeyCode.Thumbstick1 then return end
 	
 	if inputState == Enum.UserInputState.Cancel then
-		MasterControl:AddToPlayerMovement(-currentMoveVector)
-		currentMoveVector =  Vector3.new(0,0,0)
+		--MasterControl:AddToPlayerMovement(-self.moveVector)
+		self.moveVector =  ZERO_VECTOR3
 		return
 	end
 	
 	if inputState ~= Enum.UserInputState.End then
-		stopFollowingPath()		
+		self:StopFollowingPath()		
 		if PathDisplay then
 			PathDisplay.clearRenderedPath()
 		end
 		
-		if shouldUseNavigationLaser() then
-			bindJumpAction(true)
-			setLaserPointerMode("Hidden")
+		if self:ShouldUseNavigationLaser() then
+			self:BindJumpAction(true)
+			self:SetLaserPointerMode("Hidden")
 		end
 		
 		if inputObject.Position.magnitude > THUMBSTICK_DEADZONE then
-			MasterControl:AddToPlayerMovement(-currentMoveVector)
-			currentMoveVector = Vector3.new(inputObject.Position.X, 0, -inputObject.Position.Y)
-			if currentMoveVector.magnitude > 0 then
-				currentMoveVector = currentMoveVector.unit * math.min(1, inputObject.Position.magnitude)
+			--MasterControl:AddToPlayerMovement(-self.moveVector)
+			self.moveVector = Vector3.new(inputObject.Position.X, 0, -inputObject.Position.Y)
+			if self.moveVector.magnitude > 0 then
+				self.moveVector = self.moveVector.unit * math.min(1, inputObject.Position.magnitude)
 			end
-			MasterControl:AddToPlayerMovement(currentMoveVector)
 
-			moveLatch = true
+			self.moveLatch = true
 		end
 	else
-		MasterControl:AddToPlayerMovement(-currentMoveVector)
-		currentMoveVector =  Vector3.new(0,0,0)
+		--MasterControl:AddToPlayerMovement(-self.moveVector)
+		self.moveVector =  ZERO_VECTOR3
 		
-		if shouldUseNavigationLaser() then
-			bindJumpAction(false)
-			setLaserPointerMode("Navigation")
+		if self:ShouldUseNavigationLaser() then
+			self:BindJumpAction(false)
+			self:SetLaserPointerMode("Navigation")
 		end
 		
-		if moveLatch then
-			moveLatch = false
+		if self.moveLatch then
+			self.moveLatch = false
 			movementUpdateEvent:Fire("offtrack")
 		end
 	end
 end
 
-local function onHeartbeat(dt)
-	local newMoveVector = currentMoveVector
-	local humanoid = getLocalHumanoid()
+function VRNavigation:OnHeartbeat(dt)
+	local newMoveVector = self.moveVector
+	local humanoid = self:GetLocalHumanoid()
 	if not humanoid or not humanoid.Torso then
 		return
 	end
 
-	if moving and currentPoints then
+	if self.moving and self.currentPoints then
 		local currentPosition = humanoid.Torso.Position
 		local goalPosition = currentPoints[1]
 		local vectorToGoal = (goalPosition - currentPosition) * XZ_VECTOR3
@@ -325,7 +343,7 @@ local function onHeartbeat(dt)
 			currentPointIdx = currentPointIdx + 1
 
 			if #currentPoints == 0 then
-				stopFollowingPath()
+				self:StopFollowingPath()
 				if PathDisplay then
 					PathDisplay.clearRenderedPath()
 				end
@@ -362,7 +380,7 @@ local function onHeartbeat(dt)
 			
 			local timeSinceLastPoint = tick() - timeReachedLastPoint
 			if timeSinceLastPoint > expectedTimeToNextPoint + OFFTRACK_TIME_THRESHOLD then
-				stopFollowingPath()
+				self:StopFollowingPath()
 				if PathDisplay then
 					PathDisplay.clearRenderedPath()
 				end
@@ -370,63 +388,66 @@ local function onHeartbeat(dt)
 				movementUpdateEvent:Fire("offtrack")
 			end
 				
-			newMoveVector = currentMoveVector:Lerp(moveDir, dt * 10)
+			newMoveVector = self.moveVector:Lerp(moveDir, dt * 10)
 		end
 	end
 	
 	if IsFiniteVector3(newMoveVector) then
-		MasterControl:AddToPlayerMovement(newMoveVector - currentMoveVector)
-		currentMoveVector = newMoveVector
+		--MasterControl:AddToPlayerMovement(newMoveVector - self.moveVector)
+		self.moveVector = newMoveVector
 	end
 end
 
-local userCFrameEnabledConn = nil
-local function onUserCFrameEnabled()
-	if shouldUseNavigationLaser() then
-		bindJumpAction(false)
-		setLaserPointerMode("Navigation")
+
+function VRNavigation:OnUserCFrameEnabled()
+	if self:ShouldUseNavigationLaser() then
+		self:BindJumpAction(false)
+		self:SetLaserPointerMode("Navigation")
 	else
-		bindJumpAction(true)
-		setLaserPointerMode("Hidden")
+		self:BindJumpAction(true)
+		self:SetLaserPointerMode("Hidden")
 	end
 end
 
-function VRNavigation:Enable()
-	navigationRequestedConn = VRService.NavigationRequested:connect(onNavigationRequest)
-	heartbeatConn = RunService.Heartbeat:connect(onHeartbeat)
+function VRNavigation:Enable(enable)
+	if enable then
+		self.navigationRequestedConn = VRService.NavigationRequested:Connect(function(destinationCFrame, inputUserCFrame) self:OnNavigationRequest(destinationCFrame, inputUserCFrame) end)
+		self.heartbeatConn = RunService.Heartbeat:Connect(function(dt) self:OnHeartbeat(dt) end)
+		
+		ContextActionService:BindAction("MoveThumbstick", (function(actionName, inputState, inputObject) self:ControlCharacterGamepad(actionName, inputState, inputObject) end), false, Enum.KeyCode.Thumbstick1)
+		ContextActionService:BindActivate(Enum.UserInputType.Gamepad1, Enum.KeyCode.ButtonR2)	
+		
+		self.userCFrameEnabledConn = VRService.UserCFrameEnabled:Connect(function() self:OnUserCFrameEnabled() end)
+		self:OnUserCFrameEnabled()
 	
-	ContextActionService:BindAction("MoveThumbstick", controlCharacterGamepad, false, Enum.KeyCode.Thumbstick1)
-	ContextActionService:BindActivate(Enum.UserInputType.Gamepad1, Enum.KeyCode.ButtonR2)	
-	
-	userCFrameEnabledConn = VRService.UserCFrameEnabled:connect(onUserCFrameEnabled)
-	onUserCFrameEnabled()
-
-	pcall(function()
-		VRService:SetTouchpadMode(Enum.VRTouchpad.Left, Enum.VRTouchpadMode.VirtualThumbstick)
-		VRService:SetTouchpadMode(Enum.VRTouchpad.Right, Enum.VRTouchpadMode.ABXY)
-	end)
-end
-
-function VRNavigation:Disable()
-	stopFollowingPath()
-	
-	ContextActionService:UnbindAction("MoveThumbstick")
-	ContextActionService:UnbindActivate(Enum.UserInputType.Gamepad1, Enum.KeyCode.ButtonR2)
-	
-	bindJumpAction(false)
-	setLaserPointerMode("Disabled")
-	
-	if navigationRequestedConn then
-		navigationRequestedConn:disconnect()
-		navigationRequestedConn = nil
-	end
-	if heartbeatConn then
-		heartbeatConn:disconnect()
-		heartbeatConn = nil
-	end
-	if userCFrameEnabledConn then
-		userCFrameEnabledConn:disconnect()
-		userCFrameEnabledConn = nil
+		pcall(function()
+			VRService:SetTouchpadMode(Enum.VRTouchpad.Left, Enum.VRTouchpadMode.VirtualThumbstick)
+			VRService:SetTouchpadMode(Enum.VRTouchpad.Right, Enum.VRTouchpadMode.ABXY)
+		end)
+		self.enabled = true
+	else
+		-- Disable
+		self:StopFollowingPath()
+		
+		ContextActionService:UnbindAction("MoveThumbstick")
+		ContextActionService:UnbindActivate(Enum.UserInputType.Gamepad1, Enum.KeyCode.ButtonR2)
+		
+		self:BindJumpAction(false)
+		self:SetLaserPointerMode("Disabled")
+		
+		if self.navigationRequestedConn then
+			self.navigationRequestedConn:Disconnect()
+			self.navigationRequestedConn = nil
+		end
+		if self.heartbeatConn then
+			self.heartbeatConn:Disconnect()
+			self.heartbeatConn = nil
+		end
+		if self.userCFrameEnabledConn then
+			self.userCFrameEnabledConn:Disconnect()
+			self.userCFrameEnabledConn = nil
+		end
+		self.enabled = false
 	end
 end
 

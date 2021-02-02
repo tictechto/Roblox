@@ -1,64 +1,51 @@
--- Written By Kip Turner, Copyright Roblox 2014
--- Updated by Garnold to utilize the new PathfindingService API, 2017
+--[[
+	-- Original By Kip Turner, Copyright Roblox 2014
+	-- Updated by Garnold to utilize the new PathfindingService API, 2017
+	-- 2018 PlayerScripts Update - AllYourBlox
+--]]
 
-local FFlagUserNavigationFixClickToMoveInterruptionSuccess, FFlagUserNavigationFixClickToMoveInterruptionResult = pcall(function() return UserSettings():IsUserFeatureEnabled("UserNavigationFixClickToMoveInterruption") end)
-local FFlagUserNavigationFixClickToMoveInterruption = FFlagUserNavigationFixClickToMoveInterruptionSuccess and FFlagUserNavigationFixClickToMoveInterruptionResult
-
-local FFlagUserNavigationFixClickToMoveJumpSuccess, FFlagUserNavigationFixClickToMoveJumpResult = pcall(function() return UserSettings():IsUserFeatureEnabled("UserNavigationFixClickToMoveJump") end)
-local FFlagUserNavigationFixClickToMoveJump = FFlagUserNavigationFixClickToMoveJumpSuccess and FFlagUserNavigationFixClickToMoveJumpResult
-
-local DEBUG_NAME = "ClickToMoveController"
-
-local UIS = game:GetService("UserInputService")
+--[[ Roblox Services ]]--
+local UserInputService = game:GetService("UserInputService")
+local ContextActionService = game:GetService("ContextActionService")
 local PathfindingService = game:GetService("PathfindingService")
-local PlayerService = game:GetService("Players")
+local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local DebrisService = game:GetService('Debris')
 local ReplicatedStorage = game:GetService('ReplicatedStorage')
 local TweenService = game:GetService("TweenService")
 
-local Player = PlayerService.LocalPlayer
+--[[ Constants ]]--
+local ZERO_VECTOR3 = Vector3.new(0,0,0)
+	local movementKeys = {
+		[Enum.KeyCode.W] = true;
+		[Enum.KeyCode.A] = true;
+		[Enum.KeyCode.S] = true;
+		[Enum.KeyCode.D] = true;
+		[Enum.KeyCode.Up] = true;
+		[Enum.KeyCode.Down] = true;
+	}
+local FFlagUserNavigationFixClickToMoveInterruptionSuccess, FFlagUserNavigationFixClickToMoveInterruptionResult = pcall(function() return UserSettings():IsUserFeatureEnabled("UserNavigationFixClickToMoveInterruption") end)
+local FFlagUserNavigationFixClickToMoveInterruption = FFlagUserNavigationFixClickToMoveInterruptionSuccess and FFlagUserNavigationFixClickToMoveInterruptionResult
+
+local Player = Players.LocalPlayer
 local PlayerScripts = Player.PlayerScripts
 
-local CameraScript = script:FindFirstAncestor("CameraScript")
-local InvisicamModule = nil
-if CameraScript then
-	InvisicamModule = require(CameraScript:WaitForChild("Invisicam"))
-end
-
-local MasterControlModule = script.Parent
-local MasterControl = require(MasterControlModule)
 local TouchJump = nil
-if MasterControl then
-	local TouchJumpModule = MasterControlModule:FindFirstChild("TouchJump")
-	if TouchJumpModule then
-		TouchJump = require(TouchJumpModule)
-	end
-end
 
 local SHOW_PATH = true
 
 local RayCastIgnoreList = workspace.FindPartOnRayWithIgnoreList
 
-local math_min = math.min
-local math_max = math.max
-local math_pi = math.pi
-local math_atan2 = math.atan2
-
-local Vector3_new = Vector3.new
-local Vector2_new = Vector2.new
-local CFrame_new = CFrame.new
-
 local CurrentSeatPart = nil
 local DrivingTo = nil
 
-local XZ_VECTOR3 = Vector3_new(1, 0, 1)
-local ZERO_VECTOR3 = Vector3_new(0, 0, 0)
-local ZERO_VECTOR2 = Vector2_new(0, 0)
+local XZ_VECTOR3 = Vector3.new(1,0,1)
+local ZERO_VECTOR3 = Vector3.new(0,0,0)
+local ZERO_VECTOR2 = Vector2.new(0,0)
 
 local BindableEvent_OnFailStateChanged = nil
-if UIS.TouchEnabled then
-	BindableEvent_OnFailStateChanged = MasterControl:GetClickToMoveFailStateChanged()
+if UserInputService.TouchEnabled then
+--	BindableEvent_OnFailStateChanged = MasterControl:GetClickToMoveFailStateChanged()
 end
 
 --------------------------UTIL LIBRARY-------------------------------
@@ -153,8 +140,6 @@ local function findPlayerHumanoid(player)
 	end
 end
 
----------------------------------------------------------
-
 --------------------------CHARACTER CONTROL-------------------------------
 local CurrentIgnoreList
 
@@ -175,8 +160,6 @@ local function getIgnoreList()
 	table.insert(CurrentIgnoreList, GetCharacter())
 	return CurrentIgnoreList
 end
-
------------------------------------------------------------------------------
 
 -----------------------------------PATHER--------------------------------------
 
@@ -459,74 +442,6 @@ local function Pather(character, endPoint, surfaceNormal)
 		end
 	end
 
-	function this:OnPointReachedFixJump(reached)
-
-		if reached and not this.Cancelled then
-
-			local nextWaypointIdx = this.CurrentPoint + 1
-
-			if nextWaypointIdx > #this.pointList then
-				-- End of path reached
-				if this.stopTraverseFunc then
-					this.stopTraverseFunc()
-				end
-				this.Finished:Fire()
-				this:Cleanup()
-			else
-				local currentWaypoint = this.pointList[this.CurrentPoint]
-				local nextWaypoint = this.pointList[nextWaypointIdx]
-
-				-- If airborne, only allow to keep moving
-				-- if nextWaypoint.Action ~= Jump, or path mantains a direction
-				-- Otherwise, wait until the humanoid gets to the ground
-				local currentState = this.humanoid:GetState()
-				local isInAir = currentState == Enum.HumanoidStateType.FallingDown
-					or currentState == Enum.HumanoidStateType.Freefall
-					or currentState == Enum.HumanoidStateType.Jumping
-				
-				if isInAir then
-					local shouldWaitForGround = nextWaypoint.Action == Enum.PathWaypointAction.Jump
-					if not shouldWaitForGround and this.CurrentPoint > 1 then
-						local prevWaypoint = this.pointList[this.CurrentPoint - 1]
-
-						local prevDir = currentWaypoint.Position - prevWaypoint.Position
-						local currDir = nextWaypoint.Position - currentWaypoint.Position
-
-						local prevDirXZ = Vector2.new(prevDir.x, prevDir.z).Unit
-						local currDirXZ = Vector2.new(currDir.x, currDir.z).Unit
-
-						local THRESHOLD_COS = 0.996 -- ~cos(5 degrees)
-						shouldWaitForGround = prevDirXZ:Dot(currDirXZ) < THRESHOLD_COS
-					end
-
-					if shouldWaitForGround then
-						this.humanoid.FreeFalling:Wait()
-
-						-- Give time to the humanoid's state to change
-						-- Otherwise, the jump flag in Humanoid
-						-- will be reset by the state change
-						wait(0.1)
-					end
-				end
-
-				-- Move to the next point
-				if this.setPointFunc then
-					this.setPointFunc(nextWaypointIdx)
-				end
-				
-				if nextWaypoint.Action == Enum.PathWaypointAction.Jump then
-					this.humanoid.Jump = true
-				end
-				this.humanoid:MoveTo(nextWaypoint.Position)
-
-				this.CurrentPoint = nextWaypointIdx
-			end
-		else
-			this.PathFailed:Fire()
-			this:Cleanup()
-		end
-	end
-
 	function this:Start()
 		if CurrentSeatPart then
 			return
@@ -551,11 +466,7 @@ local function Pather(character, endPoint, surfaceNormal)
 				this.SeatedConn = this.humanoid.Seated:Connect(function(reached) this:OnPathInterrupted() end)
 				this.DiedConn = this.humanoid.Died:Connect(function(reached) this:OnPathInterrupted() end)
 			end
-			if FFlagUserNavigationFixClickToMoveJump then
-				this.MoveToConn = this.humanoid.MoveToFinished:Connect(function(reached) this:OnPointReachedFixJump(reached) end)
-			else
-				this.MoveToConn = this.humanoid.MoveToFinished:Connect(function(reached) this:OnPointReached(reached) end)
-			end
+			this.MoveToConn = this.humanoid.MoveToFinished:Connect(function(reached) this:OnPointReached(reached) end)
 			this.CurrentPoint = 1 -- The first waypoint is always the start location. Skip it.
 			this:OnPointReached(true) -- Move to first point
 		else
@@ -570,7 +481,7 @@ local function Pather(character, endPoint, surfaceNormal)
 	if not this.PathComputed then
 		-- set the end point towards the camera and raycasted towards the ground in case we hit a wall
 		local offsetPoint = this.TargetPoint + this.TargetSurfaceNormal*1.5
-		local ray = Ray.new(offsetPoint, Vector3_new(0,-1,0)*50)
+		local ray = Ray.new(offsetPoint, Vector3.new(0,-1,0)*50)
 		local newHitPart, newHitPos = RayCastIgnoreList(workspace, ray, getIgnoreList())
 		if newHitPart then
 			this.TargetPoint = newHitPos
@@ -585,13 +496,13 @@ end
 -------------------------------------------------------------------------
 
 local function IsInBottomLeft(pt)
-	local joystickHeight = math_min(Utility.ViewSizeY() * 0.33, 250)
+	local joystickHeight = math.min(Utility.ViewSizeY() * 0.33, 250)
 	local joystickWidth = joystickHeight
 	return pt.X <= joystickWidth and pt.Y > Utility.ViewSizeY() - joystickHeight
 end
 
 local function IsInBottomRight(pt)
-	local joystickHeight = math_min(Utility.ViewSizeY() * 0.33, 250)
+	local joystickHeight = math.min(Utility.ViewSizeY() * 0.33, 250)
 	local joystickWidth = joystickHeight
 	return pt.X >= Utility.ViewSizeX() - joystickWidth and pt.Y > Utility.ViewSizeY() - joystickHeight
 end
@@ -645,10 +556,10 @@ local function getExtentsSize(Parts)
 	local maxX,maxY,maxZ = -math.huge,-math.huge,-math.huge
 	local minX,minY,minZ = math.huge,math.huge,math.huge
 	for i = 1, #Parts do
-		maxX,maxY,maxZ = math_max(maxX, Parts[i].Position.X), math_max(maxY, Parts[i].Position.Y), math_max(maxZ, Parts[i].Position.Z)
-		minX,minY,minZ = math_min(minX, Parts[i].Position.X), math_min(minY, Parts[i].Position.Y), math_min(minZ, Parts[i].Position.Z)
+		maxX,maxY,maxZ = math.max(maxX, Parts[i].Position.X), math.max(maxY, Parts[i].Position.Y), math.max(maxZ, Parts[i].Position.Z)
+		minX,minY,minZ = math.min(minX, Parts[i].Position.X), math.min(minY, Parts[i].Position.Y), math.min(minZ, Parts[i].Position.Z)
 	end
-	return Region3.new(Vector3_new(minX, minY, minZ), Vector3_new(maxX, maxY, maxZ))
+	return Region3.new(Vector3.new(minX, minY, minZ), Vector3.new(maxX, maxY, maxZ))
 end
 
 local function inExtents(Extents, Position)
@@ -664,7 +575,7 @@ end
 
 local function showQuickPopupAsync(position, popupType)
 	local popup = createNewPopup(popupType)
-	popup:Place(position, Vector3_new(0,position.y,0))
+	popup:Place(position, Vector3.new(0,position.y,0))
 	local tweenIn = popup:TweenIn()
 	tweenIn.Completed:Wait()
 	local tweenOut = popup:TweenOut()
@@ -689,7 +600,7 @@ local function OnTap(tapPositions, goToPoint)
 			
 			-- inivisicam stuff
 			local initIgnore = getIgnoreList()
-			local invisicamParts = InvisicamModule and InvisicamModule:GetObscuredParts() or {}
+			local invisicamParts = {} --InvisicamModule and InvisicamModule:GetObscuredParts() or {}
 			local ignoreTab = {}
 			
 			-- add to the ignore list
@@ -734,7 +645,7 @@ local function OnTap(tapPositions, goToPoint)
 					CleanupPath()
 					
 					local destinationPopup = createNewPopup("DestinationPopup")	
-					destinationPopup:Place(hitPt, Vector3_new(0,hitPt.y,0))
+					destinationPopup:Place(hitPt, Vector3.new(0,hitPt.y,0))
 					local failurePopup = createNewPopup("FailurePopup")
 					local currentTween = destinationPopup:TweenIn()
 					
@@ -772,7 +683,7 @@ local function OnTap(tapPositions, goToPoint)
 							CleanupPath()
 						end
 						if failurePopup then
-							failurePopup:Place(hitPt, Vector3_new(0,hitPt.y,0))
+							failurePopup:Place(hitPt, Vector3.new(0,hitPt.y,0))
 							local failTweenIn = failurePopup:TweenIn()
 							failTweenIn.Completed:Wait()
 							local failTweenOut = failurePopup:TweenOut()
@@ -802,7 +713,7 @@ local function OnTap(tapPositions, goToPoint)
 			elseif hitPt and character and CurrentSeatPart then 
 				local destinationPopup = createNewPopup("DestinationPopup")	
 				ExistingIndicator = destinationPopup
-				destinationPopup:Place(hitPt, Vector3_new(0,hitPt.y,0))
+				destinationPopup:Place(hitPt, Vector3.new(0,hitPt.y,0))
 				destinationPopup:TweenIn()
 				
 				DrivingTo = hitPt
@@ -853,277 +764,297 @@ local function OnTap(tapPositions, goToPoint)
 	end
 end
 
+local function IsFinite(num)
+	return num == num and num ~= 1/0 and num ~= -1/0
+end
 
-local function CreateClickToMoveModule()
-	local this = {}
+local function findAngleBetweenXZVectors(vec2, vec1)
+	return math.atan2(vec1.X*vec2.Z-vec1.Z*vec2.X, vec1.X*vec2.X + vec1.Z*vec2.Z)
+end
 
-	local LastStateChange = 0
-	local LastState = Enum.HumanoidStateType.Running
-	local FingerTouches = {}
-	local NumUnsunkTouches = 0
-	-- PC simulation
-	local mouse1Down = tick()
-	local mouse1DownPos = Vector2_new()
-	local mouse2Down = tick()
-	local mouse2DownPos = Vector2_new()
-	local mouse2Up = tick()
-
-	local movementKeys = {
-		[Enum.KeyCode.W] = true;
-		[Enum.KeyCode.A] = true;
-		[Enum.KeyCode.S] = true;
-		[Enum.KeyCode.D] = true;
-		[Enum.KeyCode.Up] = true;
-		[Enum.KeyCode.Down] = true;
-	}
-
-	local TapConn = nil
-	local InputBeganConn = nil
-	local InputChangedConn = nil
-	local InputEndedConn = nil
-	local HumanoidDiedConn = nil
-	local CharacterChildAddedConn = nil
-	local OnCharacterAddedConn = nil
-	local CharacterChildRemovedConn = nil
-	local RenderSteppedConn = nil
-	local HumanoidSeatedConn = nil
-
-	local function disconnectEvent(event)
-		if event then
-			event:Disconnect()
-		end
+local function DisconnectEvent(event)
+	if event then
+		event:Disconnect()
 	end
+end
 
-	local function DisconnectEvents()
-		disconnectEvent(TapConn)
-		disconnectEvent(InputBeganConn)
-		disconnectEvent(InputChangedConn)
-		disconnectEvent(InputEndedConn)
-		disconnectEvent(HumanoidDiedConn)
-		disconnectEvent(CharacterChildAddedConn)
-		disconnectEvent(OnCharacterAddedConn)
-		disconnectEvent(RenderSteppedConn)
-		disconnectEvent(CharacterChildRemovedConn)
-		pcall(function() RunService:UnbindFromRenderStep("ClickToMoveRenderUpdate") end)
-		disconnectEvent(HumanoidSeatedConn)
-	end
+--[[ The ClickToMove Controller Class ]]--
+local BaseCharacterController = require(script.Parent:WaitForChild("BaseCharacterController"))
+local ClickToMove = setmetatable({}, BaseCharacterController)
+ClickToMove.__index = ClickToMove
 
-
-
-	local function IsFinite(num)
-		return num == num and num ~= 1/0 and num ~= -1/0
-	end
+function ClickToMove.new()
+	print("Instantiating Keyboard Controller")
+	local self = setmetatable(BaseCharacterController.new(), ClickToMove)
 	
-	local function findAngleBetweenXZVectors(vec2, vec1)
-		return math_atan2(vec1.X*vec2.Z-vec1.Z*vec2.X, vec1.X*vec2.X + vec1.Z*vec2.Z)
-	end
+	self.fingerTouches = {}
+	self.numUnsunkTouches = 0
+	-- PC simulation
+	self.mouse1Down = tick()
+	self.mouse1DownPos = Vector2.new()
+	self.mouse2DownTime = tick()
+	self.mouse2DownPos = Vector2.new()
+	self.mouse2UpTime = tick()
 
-	local function OnTouchBegan(input, processed)
-		if FingerTouches[input] == nil and not processed then
-			NumUnsunkTouches = NumUnsunkTouches + 1
+
+
+	self.tapConn = nil
+	self.inputBeganConn = nil
+	self.inputChangedConn = nil
+	self.inputEndedConn = nil
+	self.humanoidDiedConn = nil
+	self.characterChildAddedConn = nil
+	self.onCharacterAddedConn = nil
+	self.characterChildRemovedConn = nil
+	self.renderSteppedConn = nil
+	self.humanoidSeatedConn = nil
+	
+	self.running = false
+	
+	return self
+end
+
+function ClickToMove:DisconnectEvents()
+	DisconnectEvent(self.tapConn)
+	DisconnectEvent(self.inputBeganConn)
+	DisconnectEvent(self.inputChangedConn)
+	DisconnectEvent(self.inputEndedConn)
+	DisconnectEvent(self.humanoidDiedConn)
+	DisconnectEvent(self.characterChildAddedConn)
+	DisconnectEvent(self.onCharacterAddedConn)
+	DisconnectEvent(self.renderSteppedConn)
+	DisconnectEvent(self.characterChildRemovedConn)
+	
+	-- TODO: Resolve with ControlScript handling of seating for vehicles
+	DisconnectEvent(self.humanoidSeatedConn)
+	
+	pcall(function() RunService:UnbindFromRenderStep("ClickToMoveRenderUpdate") end)
+end
+
+function ClickToMove:OnTouchBegan(input, processed)
+	if self.fingerTouches[input] == nil and not processed then
+		self.numUnsunkTouches = self.numUnsunkTouches + 1
+	end
+	self.fingerTouches[input] = processed
+end
+
+function ClickToMove:OnTouchChanged(input, processed)
+	if self.fingerTouches[input] == nil then
+		self.fingerTouches[input] = processed
+		if not processed then
+			self.numUnsunkTouches = self.numUnsunkTouches + 1
 		end
-		FingerTouches[input] = processed
 	end
+end
 
-	local function OnTouchChanged(input, processed)
-		if FingerTouches[input] == nil then
-			FingerTouches[input] = processed
-			if not processed then
-				NumUnsunkTouches = NumUnsunkTouches + 1
-			end
-		end
+function ClickToMove:OnTouchEnded(input, processed)
+	if self.fingerTouches[input] ~= nil and self.fingerTouches[input] == false then
+		self.numUnsunkTouches = self.numUnsunkTouches - 1
 	end
-
-	local function OnTouchEnded(input, processed)
-		if FingerTouches[input] ~= nil and FingerTouches[input] == false then
-			NumUnsunkTouches = NumUnsunkTouches - 1
-		end
-		FingerTouches[input] = nil
-	end
+	self.fingerTouches[input] = nil
+end
 
 
-	local function OnCharacterAdded(character)
-		DisconnectEvents()
+function ClickToMove:OnCharacterAdded(character)
+	self:DisconnectEvents()
 
-		InputBeganConn = UIS.InputBegan:Connect(function(input, processed)
-			if input.UserInputType == Enum.UserInputType.Touch then
-				OnTouchBegan(input, processed)
+	self.inputBeganConn = UserInputService.InputBegan:Connect(function(input, processed)
+		if input.UserInputType == Enum.UserInputType.Touch then
+			self:OnTouchBegan(input, processed)
 
-				-- Give back controls when they tap both sticks
-				local wasInBottomLeft = IsInBottomLeft(input.Position)
-				local wasInBottomRight = IsInBottomRight(input.Position)
-				if wasInBottomRight or wasInBottomLeft then
-					for otherInput, _ in pairs(FingerTouches) do
-						if otherInput ~= input then
-							local otherInputInLeft = IsInBottomLeft(otherInput.Position)
-							local otherInputInRight = IsInBottomRight(otherInput.Position)
-							if otherInput.UserInputState ~= Enum.UserInputState.End and ((wasInBottomLeft and otherInputInRight) or (wasInBottomRight and otherInputInLeft)) then
-								if BindableEvent_OnFailStateChanged then
-									BindableEvent_OnFailStateChanged:Fire(true)
-								end
-								return
+			-- Give back controls when they tap both sticks
+			local wasInBottomLeft = IsInBottomLeft(input.Position)
+			local wasInBottomRight = IsInBottomRight(input.Position)
+			if wasInBottomRight or wasInBottomLeft then
+				for otherInput, _ in pairs(self.fingerTouches) do
+					if otherInput ~= input then
+						local otherInputInLeft = IsInBottomLeft(otherInput.Position)
+						local otherInputInRight = IsInBottomRight(otherInput.Position)
+						if otherInput.UserInputState ~= Enum.UserInputState.End and ((wasInBottomLeft and otherInputInRight) or (wasInBottomRight and otherInputInLeft)) then
+							if BindableEvent_OnFailStateChanged then
+								BindableEvent_OnFailStateChanged:Fire(true)
 							end
+							return
 						end
 					end
 				end
 			end
-
-			 -- Cancel path when you use the keyboard controls.
-			if processed == false and input.UserInputType == Enum.UserInputType.Keyboard and movementKeys[input.KeyCode] then
-				CleanupPath()
-			end
-			if input.UserInputType == Enum.UserInputType.MouseButton1 then
-				mouse1Down = tick()
-				mouse1DownPos = input.Position
-			end
-			if input.UserInputType == Enum.UserInputType.MouseButton2 then
-				mouse2Down = tick()
-				mouse2DownPos = input.Position
-			end
-		end)
-
-		InputChangedConn = UIS.InputChanged:Connect(function(input, processed)
-			if input.UserInputType == Enum.UserInputType.Touch then
-				OnTouchChanged(input, processed)
-			end
-		end)
-
-		InputEndedConn = UIS.InputEnded:Connect(function(input, processed)
-			if input.UserInputType == Enum.UserInputType.Touch then
-				OnTouchEnded(input, processed)
-			end
-
-			if input.UserInputType == Enum.UserInputType.MouseButton2 then
-				mouse2Up = tick()
-				local currPos = input.Position
-				if mouse2Up - mouse2Down < 0.25 and (currPos - mouse2DownPos).magnitude < 5 then
-					local positions = {currPos}
-					OnTap(positions)
-				end
-			end
-		end)
-
-		TapConn = UIS.TouchTap:Connect(function(touchPositions, processed)
-			if not processed then
-				OnTap(touchPositions)
-			end
-		end)
-		
-		local function computeThrottle(dist)
-			if dist > .2 then
-				return 0.5+(dist^2)/2
-			else
-				return 0
-			end
-		end		
-
-		local lastSteer = 0
-
-		--kP = how much the steering corrects for the current error in driving angle
-		--kD = how much the steering corrects for how quickly the error in driving angle is changing
-		local kP = 1
-		local kD = 0.5
-		local function getThrottleAndSteer(object, point)
-			local throttle, steer = 0, 0
-			local oCF = object.CFrame
-			
-			local relativePosition = oCF:pointToObjectSpace(point)
-			local relativeZDirection = -relativePosition.z
-			local relativeDistance = relativePosition.magnitude
-			
-			-- throttle quadratically increases from 0-1 as distance from the selected point goes from 0-50, after 50, throttle is 1.
-			-- this allows shorter distance travel to have more fine-tuned control.
-			throttle = computeThrottle(math_min(1,relativeDistance/50))*math.sign(relativeZDirection)
-			
-			local steerAngle = -math_atan2(-relativePosition.x, -relativePosition.z)
-			steer = steerAngle/(math_pi/4)
-
-			local steerDelta = steer - lastSteer
-			lastSteer = steer
-			local pdSteer = kP * steer + kD * steer
-			return throttle, pdSteer
 		end
-		
-		local function Update()
-			if CurrentSeatPart then
-				if DrivingTo then
-					local throttle, steer = getThrottleAndSteer(CurrentSeatPart, DrivingTo)
-					CurrentSeatPart.ThrottleFloat = throttle
-					CurrentSeatPart.SteerFloat = steer
-				else
-					CurrentSeatPart.ThrottleFloat = 0
-					CurrentSeatPart.SteerFloat = 0
-				end
-			end
-			
-			local cameraPos = workspace.CurrentCamera.CFrame.p
-			for i = 1, #activePopups do
-				local popup = activePopups[i]
-				popup.CFrame = CFrame.new(popup.CFrame.p, cameraPos)
+
+		 -- Cancel path when you use the keyboard controls.
+		if processed == false and input.UserInputType == Enum.UserInputType.Keyboard and movementKeys[input.KeyCode] then
+			CleanupPath()
+		end
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			self.mouse1DownTime = tick()
+			self.mouse1DownPos = input.Position
+		end
+		if input.UserInputType == Enum.UserInputType.MouseButton2 then
+			self.mouse2DownTime = tick()
+			self.mouse2DownPos = input.Position
+		end
+	end)
+
+	self.inputChangedConn = UserInputService.InputChanged:Connect(function(input, processed)
+		if input.UserInputType == Enum.UserInputType.Touch then
+			self:OnTouchChanged(input, processed)
+		end
+	end)
+
+	self.inputEndedConn = UserInputService.InputEnded:Connect(function(input, processed)
+		if input.UserInputType == Enum.UserInputType.Touch then
+			self:OnTouchEnded(input, processed)
+		end
+
+		if input.UserInputType == Enum.UserInputType.MouseButton2 then
+			self.mouse2UpTime = tick()
+			local currPos = input.Position
+			if self.mouse2UpTime - self.mouse2DownTime < 0.25 and (currPos - self.mouse2DownPos).magnitude < 5 then
+				local positions = {currPos}
+				OnTap(positions)
 			end
 		end
-		
-		RunService:BindToRenderStep("ClickToMoveRenderUpdate",Enum.RenderPriority.Camera.Value - 1,Update)
+	end)
+
+	self.tapConn = UserInputService.TouchTap:Connect(function(touchPositions, processed)
+		if not processed then
+			OnTap(touchPositions)
+		end
+	end)
 	
-		local function onSeated(child, active, currentSeatPart)
-			if active then
-				if TouchJump and UIS.TouchEnabled then
-					TouchJump:Enable()
-				end
-				if currentSeatPart and currentSeatPart.ClassName == "VehicleSeat" then
-					CurrentSeatPart = currentSeatPart
-				end
+	local function computeThrottle(dist)
+		if dist > .2 then
+			return 0.5+(dist^2)/2
+		else
+			return 0
+		end
+	end		
+
+	local lastSteer = 0
+
+	--kP = how much the steering corrects for the current error in driving angle
+	--kD = how much the steering corrects for how quickly the error in driving angle is changing
+	local kP = 1
+	local kD = 0.5
+	local function getThrottleAndSteer(object, point)
+		local throttle, steer = 0, 0
+		local oCF = object.CFrame
+		
+		local relativePosition = oCF:pointToObjectSpace(point)
+		local relativeZDirection = -relativePosition.z
+		local relativeDistance = relativePosition.magnitude
+		
+		-- throttle quadratically increases from 0-1 as distance from the selected point goes from 0-50, after 50, throttle is 1.
+		-- this allows shorter distance travel to have more fine-tuned control.
+		throttle = computeThrottle(math.min(1,relativeDistance/50))*math.sign(relativeZDirection)
+		
+		local steerAngle = -math.atan2(-relativePosition.x, -relativePosition.z)
+		steer = steerAngle/(math.pi/4)
+
+		local steerDelta = steer - lastSteer
+		lastSteer = steer
+		local pdSteer = kP * steer + kD * steer
+		return throttle, pdSteer
+	end
+	
+	local function Update()
+		if CurrentSeatPart then
+			if DrivingTo then
+				local throttle, steer = getThrottleAndSteer(CurrentSeatPart, DrivingTo)
+				CurrentSeatPart.ThrottleFloat = throttle
+				CurrentSeatPart.SteerFloat = steer
 			else
-				CurrentSeatPart = nil
-				if TouchJump and UIS.TouchEnabled then
-					TouchJump:Disable()
-				end
+				CurrentSeatPart.ThrottleFloat = 0
+				CurrentSeatPart.SteerFloat = 0
 			end
 		end
+		
+		local cameraPos = workspace.CurrentCamera.CFrame.p
+		for i = 1, #activePopups do
+			local popup = activePopups[i]
+			popup.CFrame = CFrame.new(popup.CFrame.p, cameraPos)
+		end
+	end
+	
+	RunService:BindToRenderStep("ClickToMoveRenderUpdate",Enum.RenderPriority.Camera.Value - 1,Update)
 
-		local function OnCharacterChildAdded(child)
-			if UIS.TouchEnabled then
-				if child:IsA('Tool') then
-					child.ManualActivationOnly = true
-				end
-			end
-			if child:IsA('Humanoid') then
-				disconnectEvent(HumanoidDiedConn)
-				HumanoidDiedConn = child.Died:Connect(function()
-					if ExistingIndicator then
-						DebrisService:AddItem(ExistingIndicator.Model, 1)
-					end
-				end)
-				HumanoidSeatedConn = child.Seated:Connect(function(active, seat) onSeated(child, active, seat) end)
-				if child.SeatPart then
-					onSeated(child, true, child.SeatPart)
-				end
+	-- TODO: Resolve with control script seating functionality
+--	local function onSeated(child, active, currentSeatPart)
+--		if active then
+--			if TouchJump and UserInputService.TouchEnabled then
+--				TouchJump:Enable()
+--			end
+--			if currentSeatPart and currentSeatPart.ClassName == "VehicleSeat" then
+--				CurrentSeatPart = currentSeatPart
+--			end
+--		else
+--			CurrentSeatPart = nil
+--			if TouchJump and UserInputService.TouchEnabled then
+--				TouchJump:Disable()
+--			end
+--		end
+--	end
+
+	local function OnCharacterChildAdded(child)
+		if UserInputService.TouchEnabled then
+			if child:IsA('Tool') then
+				child.ManualActivationOnly = true
 			end
 		end
-
-		CharacterChildAddedConn = character.ChildAdded:Connect(function(child)
-			OnCharacterChildAdded(child)
-		end)
-		CharacterChildRemovedConn = character.ChildRemoved:Connect(function(child)
-			if UIS.TouchEnabled then
-				if child:IsA('Tool') then
-					child.ManualActivationOnly = false
+		if child:IsA('Humanoid') then
+			DisconnectEvent(self.humanoidDiedConn)
+			self.humanoidDiedConn = child.Died:Connect(function()
+				if ExistingIndicator then
+					DebrisService:AddItem(ExistingIndicator.Model, 1)
 				end
-			end
-		end)
-		for _, child in pairs(character:GetChildren()) do
-			OnCharacterChildAdded(child)
+			end)
+--			self.humanoidSeatedConn = child.Seated:Connect(function(active, seat) onSeated(child, active, seat) end)
+--			if child.SeatPart then
+--				onSeated(child, true, child.SeatPart)
+--			end
 		end
 	end
 
-	local Running = false
+	self.characterChildAddedConn = character.ChildAdded:Connect(function(child)
+		OnCharacterChildAdded(child)
+	end)
+	self.characterChildRemovedConn = character.ChildRemoved:Connect(function(child)
+		if UserInputService.TouchEnabled then
+			if child:IsA('Tool') then
+				child.ManualActivationOnly = false
+			end
+		end
+	end)
+	for _, child in pairs(character:GetChildren()) do
+		OnCharacterChildAdded(child)
+	end
+end
 
-	function this:Disable()
-		if Running then
-			DisconnectEvents()
+function ClickToMove:Start()
+	self:Enable(true)
+end
+
+function ClickToMove:Stop()
+	self:Enable(false)
+end
+
+function ClickToMove:Enable(enable)
+	if enable then
+		if not self.running then
+			if Player.Character then -- retro-listen
+				self:OnCharacterAdded(Player.Character)
+			end
+			self.onCharacterAddedConn = Player.CharacterAdded:Connect(function(char)
+				self:OnCharacterAdded(char)
+			end)
+			self.running = true
+		end
+	else
+		if self.running then
+			self:DisconnectEvents()
 			CleanupPath()
 			-- Restore tool activation on shutdown
-			if UIS.TouchEnabled then
+			if UserInputService.TouchEnabled then
 				local character = Player.Character
 				if character then
 					for _, child in pairs(character:GetChildren()) do
@@ -1134,31 +1065,10 @@ local function CreateClickToMoveModule()
 				end
 			end
 			DrivingTo = nil
-			Running = false
+			self.running = false
 		end
 	end
-	function this:Stop()
-		this:Disable()
-	end
-
-	function this:Enable()
-		if not Running then
-			if Player.Character then -- retro-listen
-				OnCharacterAdded(Player.Character)
-			end
-			OnCharacterAddedConn = Player.CharacterAdded:Connect(OnCharacterAdded)
-			Running = true
-		end
-	end
-	function this:Start()
-		this:Enable()
-	end
-	
-	function this:GetName()
-		return DEBUG_NAME
-	end
-
-	return this
+	self.enabled = enable
 end
 
-return CreateClickToMoveModule()
+return ClickToMove

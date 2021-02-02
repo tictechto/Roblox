@@ -5,168 +5,198 @@
 	// Description: Implements jump controls for touch devices. Use with Thumbstick and Thumbpad
 --]]
 
-local Players = game:GetService('Players')
-local GuiService = game:GetService('GuiService')
-
-local TouchJump = {}
-
-local MasterControl = require(script.Parent)
-
---[[ Script Variables ]]--
-while not Players.LocalPlayer do
-	wait()
-end
-local LocalPlayer = Players.LocalPlayer
-local Humanoid = MasterControl:GetHumanoid()
-local JumpButton = nil
-local OnInputEnded = nil		-- defined in Create()
-local CharacterAddedConnection = nil
-local HumStateConnection = nil
-local HumChangeConnection = nil
-local ExternallyEnabled = false
-local JumpPower = 0
-local JumpStateEnabled = true
+local Players = game:GetService("Players")
+local GuiService = game:GetService("GuiService")
 
 --[[ Constants ]]--
 local TOUCH_CONTROL_SHEET = "rbxasset://textures/ui/Input/TouchControlsSheetV2.png"
 
---[[ Private Functions ]]--
+--[[ The Module ]]--
+local BaseCharacterController = require(script.Parent:WaitForChild("BaseCharacterController"))
+local TouchJump = setmetatable({}, BaseCharacterController)
+TouchJump.__index = TouchJump
 
-local function disableButton()
-	JumpButton.Visible = false
-	OnInputEnded()
+function TouchJump.new()
+	local self = setmetatable(BaseCharacterController.new(), TouchJump)
+
+	self.parentUIFrame = nil
+	self.jumpButton = nil
+	self.characterAddedConn = nil
+	self.humanoidStateEnabledChangedConn = nil
+	self.humanoidJumpPowerConn = nil
+	self.humanoidParentConn = nil
+	self.externallyEnabled = false
+	self.jumpPower = 0
+	self.jumpStateEnabled = true
+	self.isJumping = false
+	self.humanoid = nil -- saved reference because property change connections are made using it
+
+	return self
 end
 
-local function enableButton()
-	if Humanoid and ExternallyEnabled then
-		if ExternallyEnabled then
-			if Humanoid.JumpPower > 0 then
-				JumpButton.Visible = true
+function TouchJump:EnableButton(enable)
+	if enable then
+		if not self.jumpButton then
+			self:Create()
+		end
+		local humanoid = Players.LocalPlayer.Character and Players.LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+		if humanoid and self.externallyEnabled then
+			if self.externallyEnabled then
+				if humanoid.JumpPower > 0 then
+					self.jumpButton.Visible = true
+				end
+			end
+		end
+	else
+		self.jumpButton.Visible = false
+		self.isJumping = false
+		self.jumpButton.ImageRectOffset = Vector2.new(176, 222)
+	end
+end
+
+function TouchJump:UpdateEnabled()
+	if self.jumpPower > 0 and self.jumpStateEnabled then
+		self:EnableButton(true)
+	else
+		self:EnableButton(false)
+	end
+end
+
+function TouchJump:HumanoidChanged(prop)
+	local humanoid = Players.LocalPlayer.Character and Players.LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		if prop == "JumpPower" then
+			self.jumpPower =  humanoid.JumpPower
+			self:UpdateEnabled()
+		elseif prop == "Parent" then
+			if not humanoid.Parent then
+				self.humanoidChangeConn:Disconnect()
 			end
 		end
 	end
 end
 
-local function updateEnabled()
-	if JumpPower > 0 and JumpStateEnabled then
-		enableButton()
-	else
-		disableButton()
-	end
-end
-
-local function humanoidChanged(prop)
-	if prop == "JumpPower" then
-		JumpPower =  Humanoid.JumpPower
-		updateEnabled()
-	elseif prop == "Parent" then
-		if not Humanoid.Parent then
-			HumChangeConnection:disconnect()
-		end
-	end
-end
-
-local function humandoidStateEnabledChanged(state, isEnabled)
+function TouchJump:HumanoidStateEnabledChanged(state, isEnabled)
 	if state == Enum.HumanoidStateType.Jumping then
-		JumpStateEnabled = isEnabled
-		updateEnabled()
+		self.jumpStateEnabled = isEnabled
+		self:UpdateEnabled()
 	end
 end
 
-local function characterAdded(newCharacter)
-	if HumChangeConnection then
-		HumChangeConnection:disconnect()
+function TouchJump:CharacterAdded(char)
+	if self.humanoidChangeConn then
+		self.humanoidChangeConn:Disconnect()
+		self.humanoidChangeConn = nil
 	end
-	-- rebind event to new Humanoid
-	Humanoid = nil
-	repeat
-		Humanoid = MasterControl:GetHumanoid()
-		wait()
-	until Humanoid and Humanoid.Parent == newCharacter
-	HumChangeConnection = Humanoid.Changed:connect(humanoidChanged)
-	HumStateConnection = Humanoid.StateEnabledChanged:connect(humandoidStateEnabledChanged)
-	JumpPower = Humanoid.JumpPower
-	JumpStateEnabled = Humanoid:GetStateEnabled(Enum.HumanoidStateType.Jumping)
-	updateEnabled()
+
+	self.humanoid = char:FindFirstChildOfClass("Humanoid")
+	while not self.humanoid do
+		char.ChildAdded:wait()
+		self.humanoid = char:FindFirstChildOfClass("Humanoid")
+	end
+
+	self.humanoidJumpPowerConn = self.humanoid:GetPropertyChangedSignal("JumpPower"):Connect(function()
+		self.jumpPower =  self.humanoid.JumpPower
+		self:UpdateEnabled()
+	end)
+
+	self.humanoidParentConn = self.humanoid:GetPropertyChangedSignal("Parent"):Connect(function()
+		if not self.humanoid.Parent then
+			self.humanoidJumpPowerConn:Disconnect()
+			self.humanoidJumpPowerConn = nil
+			self.humanoidParentConn:Disconnect()
+			self.humanoidParentConn = nil
+		end
+	end)
+
+	self.humanoidStateEnabledChangedConn = self.humanoid.StateEnabledChanged:Connect(function(state, enabled)
+		self:HumanoidStateEnabledChanged(state, enabled)
+	end)
+
+	self.jumpPower = self.humanoid.JumpPower
+	self.jumpStateEnabled = self.humanoid:GetStateEnabled(Enum.HumanoidStateType.Jumping)
+	self:UpdateEnabled()
 end
 
-local function setupCharacterAddedFunction()
-	CharacterAddedConnection = LocalPlayer.CharacterAdded:connect(characterAdded)
-	if LocalPlayer.Character then
-		characterAdded(LocalPlayer.Character)
+function TouchJump:SetupCharacterAddedFunction()
+	self.characterAddedConn = Players.LocalPlayer.CharacterAdded:Connect(function(char)
+		self:CharacterAdded(char)
+	end)
+	if Players.LocalPlayer.Character then
+		self:CharacterAdded(Players.LocalPlayer.Character)
 	end
 end
 
 --[[ Public API ]]--
-function TouchJump:Enable()
-	ExternallyEnabled = true
-	enableButton()
+function TouchJump:Enable(enable, parentFrame)
+	self.parentUIFrame = parentFrame
+	self.externallyEnabled = enable
+	self:EnableButton(enable)
 end
 
-function TouchJump:Disable()
-	ExternallyEnabled = false
-	disableButton()
-end
-
-function TouchJump:Create(parentFrame)
-	if JumpButton then
-		JumpButton:Destroy()
-		JumpButton = nil
+function TouchJump:Create()
+	if not self.parentUIFrame then
+		return
 	end
-	
-	local minAxis = math.min(parentFrame.AbsoluteSize.x, parentFrame.AbsoluteSize.y)
+
+	if self.jumpButton then
+		self.jumpButton:Destroy()
+		self.jumpButton = nil
+	end
+
+	local minAxis = math.min(self.parentUIFrame.AbsoluteSize.x, self.parentUIFrame.AbsoluteSize.y)
 	local isSmallScreen = minAxis <= 500
 	local jumpButtonSize = isSmallScreen and 70 or 120
-	
-	JumpButton = Instance.new('ImageButton')
-	JumpButton.Name = "JumpButton"
-	JumpButton.Visible = false
-	JumpButton.BackgroundTransparency = 1
-	JumpButton.Image = TOUCH_CONTROL_SHEET
-	JumpButton.ImageRectOffset = Vector2.new(1, 146)
-	JumpButton.ImageRectSize = Vector2.new(144, 144)
-	JumpButton.Size = UDim2.new(0, jumpButtonSize, 0, jumpButtonSize)
 
-    JumpButton.Position = isSmallScreen and UDim2.new(1, -(jumpButtonSize*1.5-10), 1, -jumpButtonSize - 20) or
+	self.jumpButton = Instance.new("ImageButton")
+	self.jumpButton.Name = "JumpButton"
+	self.jumpButton.Visible = false
+	self.jumpButton.BackgroundTransparency = 1
+	self.jumpButton.Image = TOUCH_CONTROL_SHEET
+	self.jumpButton.ImageRectOffset = Vector2.new(1, 146)
+	self.jumpButton.ImageRectSize = Vector2.new(144, 144)
+	self.jumpButton.Size = UDim2.new(0, jumpButtonSize, 0, jumpButtonSize)
+
+    self.jumpButton.Position = isSmallScreen and UDim2.new(1, -(jumpButtonSize*1.5-10), 1, -jumpButtonSize - 20) or
         UDim2.new(1, -(jumpButtonSize*1.5-10), 1, -jumpButtonSize * 1.75)
-	
-	local touchObject = nil	
-	JumpButton.InputBegan:connect(function(inputObject)
+
+	local touchObject = nil
+	self.jumpButton.InputBegan:connect(function(inputObject)
 		--A touch that starts elsewhere on the screen will be sent to a frame's InputBegan event
 		--if it moves over the frame. So we check that this is actually a new touch (inputObject.UserInputState ~= Enum.UserInputState.Begin)
 		if touchObject or inputObject.UserInputType ~= Enum.UserInputType.Touch
 			or inputObject.UserInputState ~= Enum.UserInputState.Begin then
 			return
 		end
-		
+
 		touchObject = inputObject
-		JumpButton.ImageRectOffset = Vector2.new(146, 146)
-		MasterControl:SetIsJumping(true)
+		self.jumpButton.ImageRectOffset = Vector2.new(146, 146)
+		self.isJumping = true
 	end)
-	
-	OnInputEnded = function()
+
+	local OnInputEnded = function()
 		touchObject = nil
-		MasterControl:SetIsJumping(false)
-		JumpButton.ImageRectOffset = Vector2.new(1, 146)
+		self.isJumping = false
+		self.jumpButton.ImageRectOffset = Vector2.new(1, 146)
 	end
-	
-	JumpButton.InputEnded:connect(function(inputObject)
+
+	self.jumpButton.InputEnded:connect(function(inputObject)
 		if inputObject == touchObject then
 			OnInputEnded()
 		end
 	end)
-	
+
 	GuiService.MenuOpened:connect(function()
 		if touchObject then
 			OnInputEnded()
 		end
 	end)
-	
-	if not CharacterAddedConnection then
-		setupCharacterAddedFunction()
+
+	if not self.characterAddedConn then
+		self:SetupCharacterAddedFunction()
 	end
-	
-	JumpButton.Parent = parentFrame
+
+	self.jumpButton.Parent = self.parentUIFrame
 end
 
 return TouchJump
